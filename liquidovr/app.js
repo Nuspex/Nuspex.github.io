@@ -515,6 +515,127 @@ function attachThumb(thumbEl, f) {
   if (thumbObserver) thumbObserver.observe(thumbEl); else thumbEl._loadThumb();
 }
 
+// ── превью папок: кадр из первого видео папки (или подпапки) + число видео ──
+// Ответ Диска кешируется на сутки, а сама картинка — то же превью видео, что и в его карточке (делается один раз).
+const FPREV_TTL = 15 * 60 * 1000;   // 15 минут: новая обложка, положенная в папку, появится быстро
+const COVER_NAMES = /^(cover|poster|folder|preview|thumb|thumbnail|обложка|превью|постер)$/i;
+const folderPrevs = new Map();   // id → Promise<{ v, n, more, subs }>
+const pickVideo = (f) => (f ? { id: f.id, name: f.name, size: f.size, mimeType: f.mimeType, videoMediaMetadata: f.videoMediaMetadata } : null);
+function folderPreview(id, folderName = '') {
+  if (folderPrevs.has(id)) return folderPrevs.get(id);
+  const p = (async () => {
+    const key = 'liquido.fprev3.' + id;
+    const c = LS.get(key, null);
+    if (c && Date.now() - c.at < FPREV_TTL) return c;
+    const common = { supportsAllDrives: true, includeItemsFromAllDrives: true, orderBy: 'name' };
+    const vq = `trashed=false and mimeType contains 'video/'`;
+    const r = await api('/files', { ...common, q: `'${esc(id)}' in parents and ${vq}`, pageSize: 100, fields: 'nextPageToken,files(' + FILE_FIELDS + ')' });
+    let vids = r.files || [];
+    const res = { v: pickVideo(vids[0]), n: vids.length, more: !!r.nextPageToken, subs: 0, at: Date.now(), cover: null };
+    // своя обложка: картинка в папке с именем cover / poster / folder / обложка / превью (или любая картинка)
+    try {
+      const im = await api('/files', { ...common, q: `'${esc(id)}' in parents and trashed=false and mimeType contains 'image/'`, pageSize: 50, fields: 'files(id,name,modifiedTime,size)' });
+      const imgs = (im.files || []).filter((x) => !/\.(heic|heif|svg)$/i.test(x.name));
+      const base = (x) => x.name.replace(/\.[a-z0-9]{2,5}$/i, '').trim().toLowerCase();
+      const own = folderName.trim().toLowerCase();
+      // 1) картинка с тем же именем, что и папка (папка «VR» → VR.jpg); 2) cover/обложка/…; 3) любая картинка
+      const c = (own && imgs.find((x) => base(x) === own)) || imgs.find((x) => COVER_NAMES.test(base(x))) || imgs[0];
+      if (c) res.cover = { id: c.id, mod: c.modifiedTime || '' };
+    } catch { /* без обложки — кадр из видео */ }
+    if (!vids.length) {          // видео нет — смотрим во вложенных папках (один уровень)
+      const sub = await api('/files', { ...common, q: `'${esc(id)}' in parents and trashed=false and mimeType='${FOLDER}'`, pageSize: 20, fields: 'nextPageToken,files(id)' });
+      const ids = (sub.files || []).map((x) => x.id);
+      res.subs = ids.length + (sub.nextPageToken ? 1 : 0);
+      if (ids.length) {
+        const r2 = await api('/files', { ...common, q: '(' + ids.map((i) => `'${esc(i)}' in parents`).join(' or ') + ') and ' + vq, pageSize: 1, fields: 'files(' + FILE_FIELDS + ')' });
+        vids = r2.files || [];
+        res.v = pickVideo(vids[0]);
+      }
+    }
+    LS.set(key, res);
+    return res;
+  })();
+  p.catch(() => folderPrevs.delete(id));   // ошибка сети — попробуем при следующем показе
+  folderPrevs.set(id, p);
+  return p;
+}
+// Обложка папки: файл с Диска → уменьшенная копия (до 900 px) в Cache Storage браузера → blob-адрес.
+// blob-адрес «свой» для страницы, поэтому картинку можно рисовать и в VR-панели (WebGL).
+const coverUrls = new Map();
+async function shrinkImage(blob) {
+  const bmp = await createImageBitmap(blob);
+  const k = Math.min(1, 900 / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+  cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+  bmp.close?.();
+  return new Promise((res) => cv.toBlob((b) => res(b || blob), 'image/jpeg', 0.88));
+}
+function coverUrl(c) {
+  const key = c.id + '|' + c.mod;
+  if (coverUrls.has(key)) return coverUrls.get(key);
+  const p = (async () => {
+    const cache = 'caches' in window ? await caches.open('liquido-covers').catch(() => null) : null;
+    const req = new Request(new URL('__cover/' + encodeURIComponent(c.id) + '?m=' + encodeURIComponent(c.mod), location.href).href);
+    let resp = cache ? await cache.match(req) : null;
+    if (!resp) {
+      const t = await getToken();
+      const r = await fetch(DRIVE + '/files/' + encodeURIComponent(c.id) + '?alt=media&supportsAllDrives=true', { headers: { Authorization: 'Bearer ' + t } });
+      if (!r.ok) throw new Error('cover ' + r.status);
+      const small = await shrinkImage(await r.blob());
+      resp = new Response(small, { headers: { 'Content-Type': small.type || 'image/jpeg' } });
+      if (cache) await cache.put(req, resp.clone()).catch(() => {});
+    }
+    return URL.createObjectURL(await resp.blob());
+  })();
+  p.catch(() => coverUrls.delete(key));
+  coverUrls.set(key, p);
+  return p;
+}
+// адрес картинки для постера папки: своя обложка, иначе кадр из видео
+async function folderImageUrl(pv) {
+  if (pv.cover) { try { return await coverUrl(pv.cover); } catch { /* не открылась — кадр из видео */ } }
+  return pv.v ? ownThumbUrl(pv.v) : null;
+}
+
+function folderCountText(pv) {
+  if (pv.n) return pv.n + (pv.more ? '+' : '') + ' ' + plural(pv.n, 'видео', 'видео', 'видео');
+  if (pv.subs) return pv.subs + (pv.subs > 20 ? '+' : '') + ' ' + plural(pv.subs, 'папка', 'папки', 'папок');
+  return 'Нет видео';
+}
+function attachFolderThumb(thumbEl, folderId, countEl, metaEl, folderName) {
+  thumbEl._loadThumb = () => queueThumb(async () => {
+    let pv;
+    try { pv = await folderPreview(folderId, folderName); } catch { return false; }
+    const txt = folderCountText(pv);
+    countEl.textContent = txt;
+    metaEl.textContent = 'Папка · ' + txt.toLowerCase();
+    const src = await folderImageUrl(pv);
+    if (!src) return false;
+    const shimmer = document.createElement('div');
+    shimmer.className = 'shimmer';
+    thumbEl.append(shimmer);
+    const ok = await new Promise((resolve) => {
+      const img = new Image();
+      img.decoding = 'async';
+      img.referrerPolicy = 'no-referrer';
+      if (!src.startsWith('blob:')) img.crossOrigin = 'anonymous';
+      img.alt = '';
+      img.onload = () => {
+        thumbEl.insertBefore(img, thumbEl.firstChild);
+        thumbEl.classList.add('has-img');
+        requestAnimationFrame(() => img.classList.add('loaded'));
+        resolve(true);
+      };
+      img.onerror = () => resolve(false);
+      img.src = src;
+    });
+    shimmer.remove();
+    return ok;
+  });
+  if (thumbObserver) thumbObserver.observe(thumbEl); else thumbEl._loadThumb();
+}
+
 function renderItems(files) {
   const list = $('#list');
   for (const f of files) {
@@ -533,11 +654,21 @@ function renderItems(files) {
 
     if (isFolder) {
       card.className = 'card folder';
-      const ic = document.createElement('div');
-      ic.className = 'ficon';
-      ic.innerHTML = ICONS.folder;
+      const wrap = document.createElement('div');
+      wrap.className = 'fwrap';
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      thumb.innerHTML = ICONS.folder;
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.innerHTML = ICONS.folder + '<span>Папка</span>';
+      const cnt = document.createElement('span');
+      cnt.className = 'fcount';
+      thumb.append(b, cnt);
+      wrap.append(thumb);
       meta.textContent = 'Папка';
-      card.append(ic, info);
+      card.append(wrap, info);
+      attachFolderThumb(thumb, f.shortcutDetails?.targetId || f.id, cnt, meta, f.name);
     } else {
       card.className = 'card';
       const thumb = document.createElement('div');
@@ -779,8 +910,8 @@ function buildEnvironment() {
 
   // «Окно» для XR-слоя: в чёткем режиме экран выводит шлем ПОД нашей сценой, поэтому зал рисуем вокруг,
   // а на месте экрана делаем прозрачную дыру (пишем альфу 0) — видео видно сквозь неё.
-  const hole = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
-    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, blending: THREE.NoBlending, depthWrite: false }));
+  // «окно» пишет в кадр готовый фильтр картинки (или прозрачность 0, если регулировок нет)
+  const hole = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), FILTER_MAT);
   hole.renderOrder = -1.2;
   hole.name = 'hole';
   hole.visible = false;
@@ -1078,14 +1209,63 @@ function applyPicture() {
   PIC_UNIFORMS.uAA.value = prefs.aa !== false ? 1 : 0;
 }
 applyPicture();
+// ── Регулировки поверх чёткого XR-слоя (без выключения слоя) ──
+// Видео в XR-слое выводит сам шлем, а наш WebGL-кадр накладывается сверху с «премультиплицированной» альфой:
+// итог = наш_цвет + (1 − наша_альфа) × видео. Этим можно затемнить/осветлить, сдвинуть к серому
+// (меньше контраста) и к тёплому/холодному. Насыщенность, резкость и «больше контраста» так не сделать —
+// для них нужен WebGL-вывод, а он на 6K/8K мигает: там эти три регулировки не применяются.
+const FILTER_U = { uC: { value: new THREE.Vector4(0, 0, 0, 0) } };
+const FILTER_MAT = new THREE.ShaderMaterial({
+  uniforms: FILTER_U,
+  vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: 'uniform vec4 uC; void main() { gl_FragColor = uC; }',
+  side: THREE.DoubleSide, transparent: true, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.ZeroFactor,
+});
+let filterDome = null;   // сфера вокруг головы с фильтром — для 180°/360°
+function overlayRGBA() {
+  const pc = prefs.picture;
+  let m = 1, r = 0, g = 0, b = 0;
+  const mul = (k) => { m *= k; r *= k; g *= k; b *= k; };
+  const add = (x, y, z) => { r += x; g += y; b += z; };
+  const c = pc.c || 0, t = pc.t || 0, br = pc.b || 0;
+  if (c < 0) { const a = -c * 0.5; mul(1 - a); add(0.5 * a, 0.5 * a, 0.5 * a); }   // меньше контраста — к серому
+  if (t) {                                                                       // теплее / холоднее
+    const a = Math.abs(t) * 0.14;
+    mul(1 - a);
+    if (t > 0) add(0.11 * Math.abs(t), 0.045 * Math.abs(t), 0);
+    else add(0, 0.03 * Math.abs(t), 0.11 * Math.abs(t));
+  }
+  if (br > 0) add(br * 0.2, br * 0.2, br * 0.2);                                // светлее
+  else if (br < 0) mul(1 + br * 0.6);                                            // темнее
+  return [r, g, b, 1 - m];
+}
+const bigVideo = () => (video.videoWidth || 0) > 4096;
+// регулировки, которым нужен WebGL-вывод (насыщенность, резкость, больше контраста)
+const glOnlyPicture = () => Math.abs(prefs.picture.s || 0) > 0.005 || (prefs.picture.sh || 0) > 0.005 || (prefs.picture.c || 0) > 0.005;
+const needsGLPicture = () => glOnlyPicture() && !bigVideo();
+function applyFilterOverlay() {
+  const on = layerOnScene;
+  const [r, g, b, a] = on ? overlayRGBA() : [0, 0, 0, 0];
+  FILTER_U.uC.value.set(r, g, b, a);
+  const active = on && (a > 0.001 || r + g + b > 0.001) && effProj() !== 'flat';
+  if (active && !filterDome && world) {
+    filterDome = new THREE.Mesh(new THREE.SphereGeometry(3, 32, 16), FILTER_MAT);
+    filterDome.renderOrder = -1.1;
+    filterDome.frustumCulled = false;
+    world.add(filterDome);
+  }
+  if (filterDome) filterDome.visible = active;
+}
 function setPicture(k, v) {
-  const was = pictureActive();
+  const was = needsGLPicture();
   prefs.picture[k] = Math.abs(v) < 0.03 ? 0 : clamp(v, k === 'sh' ? 0 : -1, 1);
   savePrefs();
   applyPicture();
-  if (was !== pictureActive()) {
-    updateMediaLayer();
-    if (pictureActive() && prefs.layers !== false) ui?.toastMsg('Регулировка картинки работает в совместимом режиме вывода');
+  if (was !== needsGLPicture()) updateMediaLayer();
+  applyFilterOverlay();
+  if (layerOnScene && bigVideo() && glOnlyPicture() && (k === 's' || k === 'sh' || (k === 'c' && v > 0))) {
+    ui?.toastMsg('На 6K/8K насыщенность, резкость и «больше контраста» не работают — иначе видео мигает', true);
   }
 }
 
@@ -1097,7 +1277,7 @@ const BG_COLOR = new THREE.Color(0x050403);
 
 function layerWanted() {
   return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
-    effProj() !== 'fisheye' && !state.swap && !pictureActive() && !domeAway() &&
+    effProj() !== 'fisheye' && !state.swap && !needsGLPicture() &&
     !(state.view === '2d' && (state.stereo !== 'mono' || state.projection !== 'flat'));
 }
 
@@ -1112,6 +1292,7 @@ function setSceneForLayer(on) {
   scene.background = on ? null : BG_COLOR;
   renderer.setClearColor(0x000000, on ? 0 : 1);
   placeScreenDecor(on);
+  applyFilterOverlay();
 }
 
 function layerTransform(dist, follow) {
@@ -1129,13 +1310,25 @@ function applyLayerProps() {
     if (effProj() === 'flat') {
       mediaLayer.transform = layerTransform(flatDist(z));
     } else {
-      const a = zoomAngle(z); // слой растягивает весь кадр на заданный угол → меньше угол = меньше картинка
+      // Отдаление в XR-слое: кадр ужимается в меньший угол обзора (окно впереди), слой при этом НЕ выключается.
+      // Раньше при отдалении включался WebGL-рендер 8K-кадра — браузер Quest не успевал копировать кадр
+      // в текстуру, и видео моргало чёрными кадрами.
+      const a = z < -0.001 ? 1 + z * 0.7 : 1;
       const zoomed = z > 0.001;
-      mediaLayer.radius = zoomed ? R : 0;   // 0 = бесконечная сфера: при движении головы картинка не «плывёт»
-      mediaLayer.transform = layerTransform(-zoomOffset(z), zoomed);
-      mediaLayer.centralHorizontalAngle = (state.projection === '360' ? 2 * Math.PI : Math.PI) * a;
-      mediaLayer.upperVerticalAngle = (Math.PI / 2) * a;
-      mediaLayer.lowerVerticalAngle = (-Math.PI / 2) * a;
+      // свойства слоя меняем только при изменении: лишние присваивания каждый кадр заставляют
+      // компоновщик шлема пересобирать слой (риск мигания при движении головы)
+      const radius = zoomed ? R : 0;   // 0 = бесконечная сфера: при движении головы картинка не «плывёт»
+      const ch = (state.projection === '360' ? 2 * Math.PI : Math.PI) * a;
+      if (mediaLayer.radius !== radius) mediaLayer.radius = radius;
+      if (Math.abs(mediaLayer.centralHorizontalAngle - ch) > 1e-5) mediaLayer.centralHorizontalAngle = ch;
+      if (Math.abs(mediaLayer.upperVerticalAngle - (Math.PI / 2) * a) > 1e-5) {
+        mediaLayer.upperVerticalAngle = (Math.PI / 2) * a;
+        mediaLayer.lowerVerticalAngle = (-Math.PI / 2) * a;
+      }
+      const tKey = [-zoomOffset(z), zoomed, headLocal.x, headLocal.y, headLocal.z, state.height, baseYaw, basePitch, tilt,
+        world.position.x, world.position.y, world.position.z]
+        .map((v) => (typeof v === 'number' ? v.toFixed(4) : v)).join('|');
+      if (tKey !== mediaLayer._tKey) { mediaLayer._tKey = tKey; mediaLayer.transform = layerTransform(-zoomOffset(z), zoomed); }
     }
   } catch (e) { console.warn('layer props', e); }
 }
@@ -1203,6 +1396,7 @@ function followHead() {
   for (const c of cams) { c.matrix.decompose(_hp, _hq, _hs); headLocal.add(_hp); }
   headLocal.multiplyScalar(1 / cams.length);
   world.worldToLocal(headLocal);
+  if (filterDome?.visible) filterDome.position.copy(headLocal);
   if (effProj() !== 'flat' && !domeAway()) {
     mediaGroup.position.set(headLocal.x, headLocal.y + state.height, headLocal.z + zoomOffset(state.zoom));
     if (mediaLayer && state.zoom > 0.001) applyLayerProps();
@@ -1303,7 +1497,10 @@ function setSpeed(v) {
 
 // ───────── плейлист: соседние видео текущей папки ─────────
 const isVideoFile = (f) => (f.mimeType || '').startsWith('video/');
-function playlist() { return nav.items.filter(isVideoFile); }
+// Очередь — видео той папки, из которой запустили просмотр. Раньше бралась текущая открытая папка:
+// если во время просмотра полистать библиотеку, «следующее» и «случайное» уходили в чужую папку.
+let playQueue = [];
+function playlist() { return playQueue.length ? playQueue : nav.items.filter(isVideoFile); }
 function playSibling(dir) {
   const list = playlist();
   const i = list.findIndex((f) => f.id === current?.id);
@@ -1476,7 +1673,7 @@ function iconButton(p, id, cx, cy, r, icon, onPress, opts = {}) {
     c.fillStyle = C.accent; c.fill();
     if (hov) { c.beginPath(); c.arc(cx, cy, r + 9, 0, Math.PI * 2); c.lineWidth = 5; c.strokeStyle = 'rgba(255,181,71,0.55)'; c.stroke(); }
   } else {
-    c.fillStyle = opts.active ? 'rgba(255,181,71,0.16)' : hov ? C.hover : C.card; c.fill();
+    c.fillStyle = opts.active ? 'rgba(255,181,71,0.16)' : hov ? '#26211c' : 'rgba(0,0,0,0)'; c.fill();   // как .icon-btn на сайте
     c.lineWidth = 3; c.strokeStyle = opts.active ? C.accent : C.line; c.stroke();
     c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); hoverRing(c, hov);
   }
@@ -1536,24 +1733,12 @@ function drawMain(p) {
   p.regions = [];
   c.clearRect(0, 0, W, H);
   c.textBaseline = 'middle';
-  // лента с вырезами-перфорацией сверху и снизу
+  // панель как плеер на сайте: тёмная поверхность, тонкая рамка, разделители между блоками
   rr(c, 4, 4, W - 8, H - 8, 24);
   c.fillStyle = C.bg; c.fill();
   c.strokeStyle = C.line; c.lineWidth = 3; c.stroke();
-  c.save();
-  c.globalCompositeOperation = 'destination-out';
-  for (const x of [TICKET.P1, TICKET.P2]) for (const y of [4, H - 4]) {
-    c.beginPath(); c.arc(x, y, TICKET.NOTCH, 0, Math.PI * 2); c.fill();
-  }
-  c.restore();
-  c.strokeStyle = C.line; c.lineWidth = 3;
-  for (const x of [TICKET.P1, TICKET.P2]) {
-    c.beginPath(); c.arc(x, 4, TICKET.NOTCH, 0, Math.PI); c.stroke();
-    c.beginPath(); c.arc(x, H - 4, TICKET.NOTCH, Math.PI, 2 * Math.PI); c.stroke();
-    c.save(); c.setLineDash([14, 12]);
-    c.beginPath(); c.moveTo(x, 4 + TICKET.NOTCH + 14); c.lineTo(x, H - 4 - TICKET.NOTCH - 14); c.stroke();
-    c.restore();
-  }
+  c.fillStyle = C.line;
+  for (const x of [TICKET.P1, TICKET.P2]) c.fillRect(x - 1, 40, 2, H - 80);
 
   // 1) сеанс: формат, название, тех. строка
   const vm = current?.videoMediaMetadata || { width: video.videoWidth };
@@ -1696,9 +1881,10 @@ function drawSettings(p) {
       PIC_KEYS.forEach((k) => setPicture(k, 0));
     }, true);
     y += STEP + 10;
-    note('Регулировки картинки работают в совместимом режиме вывода:');
+    note('Яркость, теплота и «меньше контраста» работают в чётком режиме (XR-слой).');
     y += 44;
-    note('пока они не равны нулю, чёткий XR-слой выключается автоматически.');
+    note(bigVideo() ? 'Насыщенность, резкость и «больше контраста» на 6K/8K не применяются (иначе мигает).'
+      : 'Насыщенность, резкость и «больше контраста» включают совместимый режим.');
   } else {
     label('Скорость');
     segmented(p, 'speed', CX, y, CW, RH, SPEEDS.map((v) => [v, v + '×']), prefs.speed || 1, (k) => { setSpeed(k); ui.toastMsg('Скорость ' + k + '×'); });
@@ -1745,77 +1931,148 @@ function drawFolderIcon(c, cx, cy, s) {
   rr(c, cx - s, cy - s * 0.4, s * 2, s * 1.2, s * 0.12); c.fill();
 }
 
+// VR-библиотека в стиле сайта на ПК: шапка (логотип, вкладки), заголовок папки, постеры 2:3 с подписью снизу
+const LIB_TABS = [['root', 'Мой диск'], ['shared', 'Доступные мне'], ['recent', 'Недавние']];
+const LIB_COLS = 6, LIB_ROWS = 2, LIB_PER = LIB_COLS * LIB_ROWS;
+function drawCover(c, img, x, y, w, h) {
+  const k = Math.max(w / img.naturalWidth, h / img.naturalHeight);
+  const iw = img.naturalWidth * k, ih = img.naturalHeight * k;
+  c.drawImage(img, x + (w - iw) / 2, y + (h - ih) / 2, iw, ih);
+}
+function posterBadge(c, x, y, text, folderIcon) {
+  c.font = `700 18px ${FONT}`;
+  const tw = c.measureText(text).width + text.length * 3 + (folderIcon ? 30 : 0);
+  rr(c, x, y, tw + 22, 34, 5); c.fillStyle = 'rgba(15,13,11,0.78)'; c.fill();
+  if (folderIcon) drawFolderIcon(c, x + 22, y + 18, 8);
+  c.fillStyle = C.text; spaced(c, text, x + 11 + (folderIcon ? 28 : 0), y + 18, 14);
+}
 function drawLibrary(p) {
-  const c = p.ctx, W = p.W;
-  p.begin();
-  const folder = nav.stack.length ? nav.stack[nav.stack.length - 1].name
-    : ({ shared: 'Доступные мне', recent: 'Недавние видео', search: 'Поиск: ' + nav.query }[nav.source] || 'Библиотека');
-  sheetHeader(p, '', () => {
-    let x = 64;
-    if (nav.stack.length > 1) {
-      iconButton(p, 'up', 110, 84, 46, 'back', () => {
-        nav.stack = nav.stack.slice(0, -1); ui.libPage = 0; loadList(true);
-      });
-      x = 180;
-    }
-    c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 48px ${DISPLAY}`;
-    c.fillText(ellipsize(c, folder, W - x - 200), x, 84);
-  });
+  const c = p.ctx, W = p.W, H = p.H;
+  p.regions = [];
+  c.clearRect(0, 0, W, H);
+  c.textBaseline = 'middle';
+  rr(c, 4, 4, W - 8, H - 8, 24);
+  c.fillStyle = 'rgba(15,13,11,0.97)'; c.fill();
+  c.strokeStyle = C.line; c.lineWidth = 3; c.stroke();
 
-  const items = nav.items.filter((f) => f.mimeType === FOLDER || isVideoFile(f));
-  const COLS = 4, ROWS = 3, PER = COLS * ROWS, GAP = 24;
-  const pages = Math.max(1, Math.ceil(items.length / PER));
+  // ── шапка как на сайте: ● LiquidoVR | вкладки | закрыть ──
+  c.beginPath(); c.arc(72, 64, 30, 0, Math.PI * 2); c.fillStyle = 'rgba(255,181,71,0.15)'; c.fill();
+  c.beginPath(); c.arc(72, 64, 21, 0, Math.PI * 2); c.fillStyle = C.accent; c.fill();
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 40px ${DISPLAY}`;
+  c.fillText('LiquidoVR', 114, 66);
+  let tx = 420;
+  for (const [src, label] of LIB_TABS) {
+    const active = nav.source === src && (src !== 'root' || nav.stack.length <= 1);
+    const id = 'tab:' + src, hov = p.hover === id;
+    c.font = `${active ? 600 : 500} 28px ${FONT}`;
+    const w = c.measureText(label).width;
+    c.fillStyle = active || hov ? C.text : C.muted; c.textAlign = 'left';
+    c.fillText(label, tx, 64);
+    if (active) { c.fillStyle = C.accent; c.fillRect(tx, 98, w, 4); }
+    p.region(id, tx - 14, 20, w + 28, 90, () => { ui.libPage = 0; openSource(src); ui.redraw(); });
+    tx += w + 56;
+  }
+  iconButton(p, 'close', W - 82, 64, 38, 'close', () => { ui.sheet = null; ui.setVisible(true); });
+  c.fillStyle = C.line; c.fillRect(4, 126, W - 8, 2);
+
+  // ── подзаголовок: ← название папки · число видео ──
+  const kind = (f) => f.shortcutDetails?.targetMimeType || f.mimeType || '';
+  const items = nav.items.filter((f) => kind(f) === FOLDER || isVideoFile(f));
+  const title = nav.stack.length ? nav.stack[nav.stack.length - 1].name
+    : ({ shared: 'Доступные мне', recent: 'Недавние видео', search: 'Поиск: ' + nav.query }[nav.source] || 'Мой диск');
+  let hx = 64;
+  if (nav.stack.length > 1) {
+    iconButton(p, 'up', 92, 186, 30, 'back', () => { nav.stack = nav.stack.slice(0, -1); ui.libPage = 0; loadList(true); });
+    hx = 140;
+  }
+  const nVid = items.filter(isVideoFile).length;
+  const countTxt = nVid ? `${nVid}${nav.pageToken ? '+' : ''} видео` : '';
+  c.font = `600 24px ${FONT}`;
+  const cw = countTxt ? c.measureText(countTxt).width : 0;
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `700 44px ${DISPLAY}`;
+  c.fillText(ellipsize(c, title, W - hx - cw - 120), hx, 188);
+  if (countTxt) { c.textAlign = 'right'; c.fillStyle = C.muted; c.font = `600 24px ${FONT}`; c.fillText(countTxt, W - 64, 190); }
+
+  // ── сетка постеров 2:3 ──
+  const GX = 28, GY = 18, PEEK = 16;
+  const tw = (W - 128 - GX * (LIB_COLS - 1)) / LIB_COLS, th = tw * 1.5, rowH = PEEK + th + 74;
+  const pages = Math.max(1, Math.ceil(items.length / LIB_PER));
   ui.libPage = clamp(ui.libPage, 0, pages - 1);
-  const tw = (W - 128 - GAP * (COLS - 1)) / COLS, th = tw * 9 / 16, tileH = th + 78;
-  const pageItems = items.slice(ui.libPage * PER, ui.libPage * PER + PER);
+  const pageItems = items.slice(ui.libPage * LIB_PER, ui.libPage * LIB_PER + LIB_PER);
   if (!items.length) {
-    c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `600 34px ${FONT}`;
-    c.fillText(nav.loading ? 'Загрузка…' : 'Здесь нет видео', W / 2, 500);
+    c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `600 32px ${FONT}`;
+    c.fillText(nav.loading ? 'Загрузка…' : (account ? 'Здесь нет видео' : 'Google Диск не подключён'), W / 2, 600);
   }
   pageItems.forEach((f, i) => {
-    const x = 64 + (i % COLS) * (tw + GAP), y = 160 + Math.floor(i / COLS) * (tileH + GAP);
+    const x = 64 + (i % LIB_COLS) * (tw + GX), y0 = 236 + Math.floor(i / LIB_COLS) * (rowH + GY), y = y0 + PEEK;
     const id = 'lib:' + f.id, hov = p.hover === id, isCur = f.id === current?.id;
-    rr(c, x, y, tw, tileH, 16);
-    c.fillStyle = hov ? C.hover : C.card; c.fill();
-    c.lineWidth = isCur || hov ? 5 : 3; c.strokeStyle = isCur || hov ? C.accent : C.line; c.stroke();
+    const isFolder = kind(f) === FOLDER;
+    if (isFolder) {           // два листа «стопкой» за постером
+      c.lineWidth = 2;
+      rr(c, x + tw * 0.13, y0 - (hov ? 4 : 0), tw * 0.74, 34, 8); c.fillStyle = '#2b241d'; c.fill();
+      c.strokeStyle = hov ? 'rgba(255,181,71,0.6)' : '#4a3f33'; c.stroke();
+      rr(c, x + tw * 0.065, y0 + 8 - (hov ? 2 : 0), tw * 0.87, 34, 8); c.fillStyle = '#3a3026'; c.fill();
+      c.strokeStyle = hov ? 'rgba(255,181,71,0.6)' : '#5a4c3d'; c.stroke();
+    }
     c.save();
-    rr(c, x, y, tw, th, 16); c.clip();
-    c.fillStyle = '#15110d'; c.fillRect(x, y, tw, th);
-    if (f.mimeType === FOLDER) drawFolderIcon(c, x + tw / 2, y + th / 2, 46);
-    else {
-      const img = vrThumb(f);
-      if (img && img.ok) {
-        const k = Math.max(tw / img.naturalWidth, th / img.naturalHeight);
-        const iw = img.naturalWidth * k, ih = img.naturalHeight * k;
-        c.drawImage(img, x + (tw - iw) / 2, y + (th - ih) / 2, iw, ih);
-      } else drawIcon(c, 'play', x + tw / 2, y + th / 2, 60, 'rgba(244,236,225,0.25)');
-      const d = f.videoMediaMetadata?.durationMillis;
-      if (d) {
-        const t = fmtTime(d / 1000);
-        c.font = `700 24px ${FONT}`;
-        const w2 = c.measureText(t).width + 24;
-        rr(c, x + tw - w2 - 10, y + th - 44, w2, 34, 6); c.fillStyle = 'rgba(15,13,11,0.72)'; c.fill();
-        c.fillStyle = C.text; c.textAlign = 'center'; c.fillText(t, x + tw - w2 / 2 - 10, y + th - 27);
+    rr(c, x, y, tw, th, 12); c.clip();
+    const bg = c.createLinearGradient(x, y, x + tw * 0.3, y + th);
+    bg.addColorStop(0, isFolder ? '#3a2a1b' : '#2b2119'); bg.addColorStop(1, '#15110d');
+    c.fillStyle = bg; c.fillRect(x, y, tw, th);
+    let meta = '';
+    if (isFolder) {
+      const fi = vrFolder(f);
+      if (fi.img && fi.img.ok) drawCover(c, fi.img, x, y, tw, th);
+      else drawFolderIcon(c, x + tw / 2, y + th / 2, 34);
+      meta = 'Папка' + (fi.txt ? ' · ' + fi.txt.toLowerCase() : '');
+      const g = c.createLinearGradient(0, y + th * 0.45, 0, y + th);
+      g.addColorStop(0, 'rgba(15,13,11,0)'); g.addColorStop(1, 'rgba(15,13,11,0.88)');
+      c.fillStyle = g; c.fillRect(x, y, tw, th);
+      posterBadge(c, x + 12, y + 12, 'ПАПКА', true);
+      if (fi.txt) {
+        c.fillStyle = C.accent; c.fillRect(x + 14, y + th - 26, 22, 3);
+        c.textAlign = 'left'; c.fillStyle = C.text; c.font = `600 19px ${FONT}`;
+        spaced(c, fi.txt.toUpperCase(), x + 46, y + th - 24, 14);
       }
+    } else {
+      const img = vrThumb(f);
+      if (img && img.ok) drawCover(c, img, x, y, tw, th);
+      else drawIcon(c, 'play', x + tw / 2, y + th / 2, 56, 'rgba(244,236,225,0.2)');
+      const g = c.createLinearGradient(0, y + th * 0.6, 0, y + th);
+      g.addColorStop(0, 'rgba(15,13,11,0)'); g.addColorStop(1, 'rgba(15,13,11,0.5)');
+      c.fillStyle = g; c.fillRect(x, y, tw, th);
+      posterBadge(c, x + 12, y + 12, formatLabel(fileFormat(f)).toUpperCase(), false);
+      const d = (f.videoMediaMetadata?.durationMillis || 0) / 1000;
       const pos = LS.get('liquido.pos.' + f.id, 0);
-      if (pos > 0 && d) { c.fillStyle = C.accent; c.fillRect(x, y + th - 6, tw * clamp(pos / (d / 1000), 0.02, 1), 6); }
+      if (pos > 0 && d) { c.fillStyle = C.accent; c.fillRect(x, y + th - 5, tw * clamp(pos / d, 0.02, 1), 5); }
+      meta = [d ? fmtTime(d) : '', fmtBytes(f.size)].filter(Boolean).join(' · ');
+      if (hov) {               // янтарная кнопка ▶ при наведении — как на сайте
+        c.beginPath(); c.arc(x + tw / 2, y + th / 2, 40, 0, Math.PI * 2); c.fillStyle = C.accent; c.fill();
+        drawIcon(c, 'play', x + tw / 2 + 3, y + th / 2, 44, C.onAccent);
+      }
     }
     c.restore();
-    c.textAlign = 'left'; c.fillStyle = isCur ? C.accent : C.text; c.font = `700 28px ${DISPLAY}`;
-    c.fillText(ellipsize(c, f.name, tw - 28), x + 16, y + th + 40);
-    p.region(id, x, y, tw, tileH, () => {
-      if (f.mimeType === FOLDER) { nav.stack.push({ id: f.id, name: f.name }); ui.libPage = 0; loadList(true); ui.redraw(); }
+    rr(c, x, y, tw, th, 12); c.lineWidth = 2; c.strokeStyle = C.line; c.stroke();
+    if (hov || isCur) { rr(c, x - 7, y - 7, tw + 14, th + 14, 16); c.lineWidth = 4; c.strokeStyle = C.accent; c.stroke(); }
+    c.textAlign = 'left'; c.fillStyle = isCur ? C.accent : C.text; c.font = `700 25px ${DISPLAY}`;
+    c.fillText(ellipsize(c, f.name.replace(/\.[a-z0-9]{2,4}$/i, ''), tw), x, y + th + 30);
+    c.fillStyle = C.muted; c.font = `500 19px ${FONT}`;
+    c.fillText(ellipsize(c, meta, tw), x, y + th + 58);
+    p.region(id, x - 7, y0 - 7, tw + 14, rowH, () => {
+      if (isFolder) { nav.stack.push({ id: f.shortcutDetails?.targetId || f.id, name: f.name }); ui.libPage = 0; loadList(true); ui.redraw(); }
       else { ui.sheet = null; ui.setVisible(true); openItem(f); }
     });
   });
 
-  // страницы
-  const py = p.H - 100;
-  if (ui.libPage > 0) iconButton(p, 'pgprev', W / 2 - 200, py + 40, 40, 'back', () => { ui.libPage--; ui.redraw(); });
-  c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `700 30px ${FONT}`;
-  c.fillText(`${ui.libPage + 1} / ${pages}`, W / 2, py + 40);
-  if (ui.libPage < pages - 1) iconButton(p, 'pgnext', W / 2 + 200, py + 40, 40, 'next', () => { ui.libPage++; ui.redraw(); });
-  else if (nav.pageToken) textButton(p, 'more', W / 2 + 150, py + 4, 300, 72, 'Загрузить ещё', () => loadList(false));
+  // ── страницы ──
+  const py = H - 52;
+  if (ui.libPage > 0) iconButton(p, 'pgprev', W / 2 - 170, py, 30, 'back', () => { ui.libPage--; ui.redraw(); });
+  if (pages > 1 || nav.pageToken) {
+    c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `600 26px ${FONT}`;
+    c.fillText(`${ui.libPage + 1} / ${pages}`, W / 2, py);
+  }
+  if (ui.libPage < pages - 1) iconButton(p, 'pgnext', W / 2 + 170, py, 30, 'next', () => { ui.libPage++; ui.redraw(); });
+  else if (nav.pageToken) textButton(p, 'more', W / 2 + 130, py - 32, 300, 64, 'Показать ещё', () => loadList(false));
   p.end();
 }
 
@@ -1867,6 +2124,28 @@ function drawPair(p) {
     });
   });
   p.end();
+}
+
+// превью папки в VR-библиотеке: кадр из видео папки + число видео
+const vrFolderInfo = new Map();
+function vrFolder(f) {
+  const id = f.shortcutDetails?.targetId || f.id;
+  if (vrFolderInfo.has(id)) return vrFolderInfo.get(id);
+  const info = { img: null, txt: '' };
+  vrFolderInfo.set(id, info);
+  folderPreview(id, f.name).then(async (pv) => {
+    info.txt = folderCountText(pv);
+    const src = await folderImageUrl(pv);
+    if (src && src.startsWith('blob:')) {
+      const img = new Image();
+      img.ok = false;
+      img.onload = () => { img.ok = true; ui?.redraw(); };
+      img.src = src;
+      info.img = img;
+    } else if (pv.v) info.img = vrThumb(pv.v);
+    ui?.redraw();
+  }).catch(() => vrFolderInfo.delete(id));
+  return info;
 }
 
 // превью для VR-библиотеки: только свои (same-origin), иначе canvas станет «грязным» для WebGL
@@ -1963,9 +2242,9 @@ class VRUI {
   openSettings(open) { this.openSheet('settings', open); }
   openLibrary(open) {
     if ((open ?? this.sheet !== 'library') && current) {
-      const list = nav.items.filter((f) => f.mimeType === FOLDER || isVideoFile(f));
+      const list = nav.items.filter((f) => (f.shortcutDetails?.targetMimeType || f.mimeType) === FOLDER || isVideoFile(f));
       const i = list.findIndex((f) => f.id === current.id);
-      if (i >= 0) this.libPage = Math.floor(i / 12);
+      if (i >= 0) this.libPage = Math.floor(i / LIB_PER);
     }
     this.openSheet('library', open);
   }
@@ -2150,6 +2429,8 @@ function renderFrame() {
 
 // ───────────────────────── воспроизведение ─────────────────────────
 async function playFile(f) {
+  const here = nav.items.filter(isVideoFile);
+  if (here.some((x) => x.id === f.id)) playQueue = here;   // запомнили папку, из которой смотрим
   await ensureSW();
   await getToken();
   await sendAuthToSW();
@@ -2458,7 +2739,7 @@ async function init() {
   renderHero();
   // отладка на ПК: ?debug — доступ к VR-панелям из консоли (отрисовка без шлема)
   if (new URLSearchParams(location.search).has('debug')) {
-    window.__liquido = { get ui() { return ui; }, state, setFormat, setZoom, initScene, fontsReady };
+    window.__liquido = { get ui() { return ui; }, state, setFormat, setZoom, initScene, fontsReady, coverUrl, folderPreview, get scene() { return scene; } };
   }
   if (!window.isSecureContext) {
     banner('Откройте плеер по адресу http://localhost:8080 или через приложение LiquidoVR. По IP-адресу VR и поток работать не будут.');

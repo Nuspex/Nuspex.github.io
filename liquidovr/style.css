@@ -158,12 +158,26 @@ main { padding: 0 var(--pad) 64px; max-width: 1600px; margin: 0 auto; }
 .card:hover .play-hint { opacity: 1; }
 .card .name { font: 700 18px/1.25 var(--font-display); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .card .meta { color: var(--muted); font-size: 13px; line-height: 1.4; margin-top: 4px; }
-.card.folder { grid-column: span 1; flex-direction: row; align-items: center; gap: 14px; padding: 14px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--line); transition: border-color .18s; }
-.card.folder:hover, .card.folder:focus-visible { border-color: var(--accent); }
-.card.folder .ficon { width: 46px; height: 46px; border-radius: var(--radius); display: grid; place-items: center; background: var(--surface-2); flex: none; }
-.card.folder .ficon svg { width: 22px; height: 22px; color: var(--accent); }
-.card.folder .info { min-width: 0; }
-.card.folder .name { -webkit-line-clamp: 2; }
+/* папка — тот же постер 2:3, но «стопкой»: за ним выглядывают два листа, внутри — кадр из видео папки */
+.card.folder .fwrap { position: relative; padding-top: 16px; }
+.card.folder .fwrap::before, .card.folder .fwrap::after {
+  content: ""; position: absolute; border: 1px solid var(--line); border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0;
+  transition: transform .25s, border-color .18s;
+}
+.card.folder .fwrap::before { left: 13%; right: 13%; top: 0; height: 26px; background: #2b241d; border-color: #4a3f33; }
+.card.folder .fwrap::after { left: 6.5%; right: 6.5%; top: 8px; height: 26px; background: #3a3026; border-color: #5a4c3d; }
+.card.folder:hover .fwrap::before { transform: translateY(-4px); border-color: rgba(255, 181, 71, .5); }
+.card.folder:hover .fwrap::after { transform: translateY(-2px); border-color: rgba(255, 181, 71, .5); }
+.card.folder .thumb { z-index: 1; background: radial-gradient(120% 80% at 50% 0%, #3a2a1b, #15110d 70%); }
+.card.folder .thumb > svg { width: 56px; height: 56px; color: rgba(255, 181, 71, .35); stroke-width: 1.3; }
+.card.folder .thumb::after { background: linear-gradient(transparent 45%, rgba(15, 13, 11, .85)); }
+.card.folder .badge { display: inline-flex; align-items: center; gap: 6px; }
+.card.folder .badge svg { width: 13px; height: 13px; color: var(--accent); stroke-width: 2.2; }
+.card.folder .fcount {
+  position: absolute; z-index: 2; left: 12px; right: 12px; bottom: 12px; display: flex; align-items: center; gap: 8px;
+  font: 600 12px/1.2 var(--font-sans); letter-spacing: .08em; text-transform: uppercase; color: var(--text);
+}
+.card.folder .fcount::before { content: ""; width: 18px; height: 2px; background: var(--accent); flex: none; }
 
 .status { color: var(--muted); margin: 32px 0; white-space: pre-line; text-align: center; font-size: 15px; }
 .status.error { color: var(--danger); }
@@ -265,3 +279,4 @@ dialog .row { display: flex; justify-content: flex-end; gap: 10px; margin-top: 2
   #nowFmt { width: 100%; }
   .linkbox input { min-width: 0; }
 }
+.card.folder .thumb.has-img > svg { display: none; }
