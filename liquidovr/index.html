@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LiquidoVR</title>
-  <meta name="theme-color" content="#070910">
+  <meta name="theme-color" content="#0f0d0b">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/logo.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
   <script type="importmap">
     { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
@@ -18,17 +18,24 @@
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
-
   <header class="appbar">
     <a class="logo" href="./" aria-label="LiquidoVR — на главную">
-      <img src="icons/logo.svg" alt="">
-      <span>Liquido<b>VR</b></span>
+      <i class="logo-dot" aria-hidden="true"></i>
+      <span>LiquidoVR</span>
     </a>
+    <nav class="tabs" role="tablist" aria-label="Источник">
+      <button data-src="root" class="active">Мой диск</button>
+      <button data-src="shared">Доступные мне</button>
+      <button data-src="recent">Недавние</button>
+    </nav>
     <div class="appbar-right">
+      <form id="searchForm" class="search" role="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="searchInput" placeholder="Найти видео или вставить ссылку" autocomplete="off" aria-label="Поиск или ссылка Google Диска">
+      </form>
       <span id="who" class="pill"></span>
-      <button id="btnInstall" class="btn ghost" hidden>Установить приложение</button>
-      <button id="btnLogin" class="btn">Проверить подключение</button>
+      <button id="btnInstall" class="btn ghost small" hidden>Установить приложение</button>
+      <button id="btnLogin" class="btn ghost small">Проверить подключение</button>
       <button id="btnPrefs" class="icon-btn" title="Настройки" aria-label="Настройки">
         <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
       </button>
@@ -40,26 +47,14 @@
   <main>
     <!-- Библиотека -->
     <section id="viewBrowser">
-      <div class="hero">
-        <h1>Ваша VR-библиотека</h1>
-        <p>Видео с Google Диска — сразу в шлем, без скачивания.</p>
-      </div>
-
-      <div class="toolbar">
-        <div class="segmented tabs" role="tablist">
-          <button data-src="root" class="active">Мой диск</button>
-          <button data-src="shared">Доступные мне</button>
-          <button data-src="recent">Недавние</button>
-        </div>
-        <form id="searchForm" class="search" role="search">
-          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          <input id="searchInput" placeholder="Поиск видео" autocomplete="off">
-        </form>
-      </div>
+      <!-- «Продолжить»: заполняется из app.js (renderHero) -->
+      <div id="hero" class="hero"></div>
 
       <div class="subbar">
-        <nav id="crumbs"></nav>
+        <h2 id="folderTitle">Мой диск</h2>
         <div class="subbar-right">
+          <nav id="crumbs" aria-label="Путь"></nav>
+          <span id="listCount" class="count"></span>
           <label class="switch"><input type="checkbox" id="showAll"><span></span>Все файлы</label>
           <details class="linkbox">
             <summary>Открыть по ссылке</summary>
@@ -79,8 +74,9 @@
     <!-- Плеер -->
     <section id="viewPlayer" hidden>
       <div class="player-head">
-        <button id="btnBack" class="btn ghost">← Библиотека</button>
+        <button id="btnBack" class="btn ghost small">← Библиотека</button>
         <div id="nowTitle"></div>
+        <span id="nowFmt" class="eyebrow"></span>
       </div>
 
       <div id="stage">
@@ -91,12 +87,12 @@
         </button>
       </div>
 
-      <div class="transport glass">
-        <button id="cBack" class="icon-btn" title="−10 с">
+      <div class="transport panel">
+        <button id="cBack" class="icon-btn" title="−10 с" aria-label="Назад 10 секунд">
           <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
         </button>
-        <button id="cPlay" class="play-btn" title="Пауза/пуск"></button>
-        <button id="cFwd" class="icon-btn" title="+10 с">
+        <button id="cPlay" class="play-btn" title="Пауза/пуск" aria-label="Пауза или пуск"></button>
+        <button id="cFwd" class="icon-btn" title="+10 с" aria-label="Вперёд 10 секунд">
           <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
         </button>
         <span id="cTimeCur" class="time">0:00</span>
@@ -104,31 +100,35 @@
         <span id="cTime" class="time">0:00</span>
       </div>
 
-      <div class="formats glass">
+      <div class="formats panel">
         <div class="field">
-          <span>Проекция</span>
-          <div class="segmented" id="segProj"></div>
+          <span class="label">Проекция</span>
+          <div class="chips" id="segProj"></div>
         </div>
         <div class="field">
-          <span>3D-режим</span>
-          <div class="segmented" id="segStereo"></div>
+          <span class="label">3D-режим</span>
+          <div class="chips" id="segStereo"></div>
         </div>
         <div class="field">
-          <span>Глаза</span>
+          <span class="label">Качество</span>
+          <div class="chips" id="segQuality"></div>
+        </div>
+        <div class="field">
+          <span class="label">Глаза</span>
           <label class="switch"><input type="checkbox" id="cSwap"><span></span>Поменять</label>
         </div>
         <div class="field grow">
-          <span>Зум <b id="cZoomVal">0%</b></span>
+          <span class="label">Зум <b id="cZoomVal">0%</b></span>
           <input type="range" id="cZoom" min="-100" max="100" value="0">
         </div>
         <div class="field grow">
-          <span>Громкость</span>
+          <span class="label">Громкость</span>
           <input type="range" id="cVol" min="0" max="100" value="100">
         </div>
         <button id="cCenter" class="btn ghost small">Центрировать</button>
       </div>
 
-      <div class="hint glass">
+      <div class="hint panel">
         <b>Управление в VR</b>
         <div class="keys">
           <span><kbd>Правый стик ↔</kbd> зум</span>
@@ -150,10 +150,10 @@
     <form method="dialog">
       <h2>Настройки</h2>
       <p class="muted">Применяются к новым видео. Если в имени файла есть метка (_360, _TB, _2D…), она важнее.</p>
-      <div class="field"><span>Проекция по умолчанию</span><div class="segmented" id="prefProj"></div></div>
-      <div class="field"><span>3D-режим по умолчанию</span><div class="segmented" id="prefStereo"></div></div>
-      <div class="field"><span>Зум по умолчанию <b id="prefZoomVal"></b></span><input type="range" id="prefZoom" min="-100" max="100"></div>
-      <div class="field"><span>Качество рендера в VR</span><div class="segmented" id="prefQuality"></div>
+      <div class="field"><span class="label">Проекция по умолчанию</span><div class="chips" id="prefProj"></div></div>
+      <div class="field"><span class="label">3D-режим по умолчанию</span><div class="chips" id="prefStereo"></div></div>
+      <div class="field"><span class="label">Зум по умолчанию <b id="prefZoomVal"></b></span><input type="range" id="prefZoom" min="-100" max="100"></div>
+      <div class="field"><span class="label">Качество рендера в VR</span><div class="chips" id="prefQuality"></div>
         <small class="muted">8K — максимальная чёткость (больше нагрузка на шлем).</small></div>
       <label class="switch"><input type="checkbox" id="prefSwap"><span></span>Поменять глаза местами</label>
       <label class="switch"><input type="checkbox" id="prefAutoVR"><span></span>Сразу входить в VR при выборе видео</label>

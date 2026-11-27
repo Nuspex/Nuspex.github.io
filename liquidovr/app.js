@@ -60,7 +60,7 @@ const QUALITY = {
 const QUALITY_KEYS = ['std', 'high', '8k'];
 const DEFAULT_PREFS = {
   projection: '180', stereo: 'sbs', swap: false, zoom: 0, quality: '8k', autoVR: true, volume: 1, layers: true,
-  speed: 1, autoNext: true, fisheyeFov: 180, picture: { b: 0, c: 0, s: 0 },
+  speed: 1, autoNext: true, fisheyeFov: 180, picture: { b: 0, c: 0, s: 0 }, aa: true,
 };
 let prefs = { ...DEFAULT_PREFS, ...LS.get('liquido.prefs', {}) };
 prefs.picture = { b: 0, c: 0, s: 0, ...(prefs.picture || {}) };
@@ -314,8 +314,15 @@ function fileFormat(f) {
   return { ...det, ...(guess || {}), guessed: !!guess, view: '3d', zoom: prefs.zoom, height: 0, ...(saved || {}) };
 }
 function formatLabel(fmt) {
-  if (fmt.projection === 'flat') return fmt.stereo === 'mono' ? '2D' : '3D ' + (fmt.stereo === 'sbs' ? 'SBS' : 'TB');
-  return PROJ_NAME[fmt.projection] + (fmt.stereo === 'mono' ? '' : ' 3D');
+  if (fmt.projection === 'flat') return fmt.stereo === 'mono' ? 'Экран' : 'Экран ' + (fmt.stereo === 'tb' ? 'TB 3D' : '3D');
+  return PROJ_NAME[fmt.projection] + (fmt.stereo === 'mono' ? '' : fmt.stereo === 'tb' ? ' TB 3D' : ' 3D');
+}
+// «180° · SBS · 8K» — для героя, плеера и VR-билета
+function formatLine(fmt, vm) {
+  const parts = [PROJ_NAME[fmt.projection], fmt.stereo === 'mono' ? '2D' : fmt.stereo.toUpperCase()];
+  const w = vm?.width || 0;
+  if (w) parts.push(w >= 7000 ? '8K' : w >= 5000 ? '6K' : w >= 3800 ? '4K' : w >= 2500 ? '2.7K' : w >= 1900 ? 'HD' : w + 'p');
+  return parts.join(' · ');
 }
 function guessMime(f) {
   if ((f.mimeType || '').startsWith('video/')) return f.mimeType;
@@ -380,6 +387,7 @@ async function loadList(reset) {
     nav.items.push(...files);
     nav.pageToken = r.nextPageToken || null;
     renderItems(files);
+    updateCount();
     listStatus(nav.items.length ? '' : 'Здесь нет видео.');
     $('#btnMore').hidden = !nav.pageToken;
   } catch (e) {
@@ -394,6 +402,8 @@ function renderCrumbs() {
   const c = $('#crumbs');
   c.replaceChildren();
   const label = { shared: 'Доступные мне', recent: 'Недавние видео', search: 'Поиск: ' + nav.query }[nav.source];
+  $('#folderTitle').textContent = nav.stack.length ? nav.stack[nav.stack.length - 1].name : (label || 'Мой диск');
+  updateCount();
   if (label) {
     const b = document.createElement('button');
     b.textContent = label;
@@ -450,6 +460,12 @@ function attachThumb(thumbEl, f) {
     img.decoding = 'async';
     img.referrerPolicy = 'no-referrer';
     if (src.startsWith(PC_BASE + 'thumb/')) img.crossOrigin = 'anonymous';
+    else {
+      // превью Google — целый кадр: для 3D берём левый глаз, а не стык двух глаз по центру
+      const st = fileFormat(f).stereo;
+      if (st === 'sbs') img.style.objectPosition = '12% 50%';   // центр левой половины кадра в постере 2:3
+      if (st === 'tb') img.style.objectPosition = '50% 0%';
+    }
     img.alt = '';
     img.onload = () => { thumbEl.append(img); requestAnimationFrame(() => img.classList.add('loaded')); resolve(true); };
     img.onerror = () => resolve(false);
@@ -493,17 +509,19 @@ function renderItems(files) {
       thumb.className = 'thumb';
       thumb.innerHTML = isVideo ? ICONS.film : ICONS.file;
       const vm = f.videoMediaMetadata;
+      const durS = (vm?.durationMillis || 0) / 1000;
       if (isVideo) {
         const fmt = fileFormat(f);
         const b = document.createElement('span');
-        b.className = 'badge fmt';
+        b.className = 'badge';
         b.textContent = formatLabel(fmt);
         thumb.append(b);
-        if (vm?.durationMillis) {
-          const d = document.createElement('span');
-          d.className = 'badge dur';
-          d.textContent = fmtTime(vm.durationMillis / 1000);
-          thumb.append(d);
+        const pos = LS.get('liquido.pos.' + f.id, 0);
+        if (pos > 0 && durS > 0) {          // частично просмотрено — янтарная полоска
+          const pr = document.createElement('i');
+          pr.className = 'progress';
+          pr.style.width = clamp((pos / durS) * 100, 2, 100).toFixed(1) + '%';
+          thumb.append(pr);
         }
         const ph = document.createElement('div');
         ph.className = 'play-hint';
@@ -511,8 +529,7 @@ function renderItems(files) {
         thumb.append(ph);
         if (f.mimeType !== SHORTCUT) attachThumb(thumb, f);
       }
-      meta.textContent = [vm?.width ? (vm.width >= 7000 ? '8K' : vm.width >= 3800 ? '4K' : vm.width + '×' + vm.height) : '', fmtBytes(f.size)]
-        .filter(Boolean).join(' · ');
+      meta.textContent = [durS ? fmtTime(durS) : '', fmtBytes(f.size)].filter(Boolean).join(' · ');
       card.append(thumb, info);
     }
     card.onclick = () => {
@@ -521,6 +538,86 @@ function renderItems(files) {
     };
     list.append(card);
   }
+}
+
+// «Мой диск / Путешествия · 14 видео»
+function updateCount() {
+  const n = nav.items.filter((f) => (f.shortcutDetails?.targetMimeType || f.mimeType || '').startsWith('video/')).length;
+  $('#listCount').textContent = n ? `· ${n} ${plural(n, 'видео', 'видео', 'видео')}${nav.pageToken ? '+' : ''}` : '';
+}
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20) ? few : many;
+}
+
+// ── герой «Продолжить»: последнее недосмотренное видео (позиция уже хранится в liquido.pos.<id>) ──
+function lastWatched() {
+  const last = LS.get('liquido.last', null);
+  if (!last?.f?.id) return null;
+  const pos = LS.get('liquido.pos.' + last.f.id, 0);
+  return pos > 0 ? { ...last, pos } : null;
+}
+function renderHero() {
+  const hero = $('#hero');
+  const last = lastWatched();
+  hero.replaceChildren();
+  const left = document.createElement('div');
+  const eb = document.createElement('div');
+  eb.className = 'eyebrow';
+  const h1 = document.createElement('h1');
+  const p = document.createElement('p');
+  left.append(eb, h1, p);
+  hero.append(left);
+  if (!last) {
+    hero.className = 'hero solo';
+    eb.textContent = 'LiquidoVR';
+    h1.textContent = 'Ваш кинозал';
+    p.textContent = 'Видео с Google Диска — сразу в шлем, без скачивания.';
+    return;
+  }
+  hero.className = 'hero';
+  const f = last.f;
+  const dur = (f.videoMediaMetadata?.durationMillis || 0) / 1000;
+  eb.textContent = 'Сегодня в зале · Google Диск';
+  h1.textContent = f.name.replace(/\.[a-z0-9]{2,4}$/i, '');
+  p.textContent = `Остановились на ${fmtTime(last.pos)}${dur ? ' из ' + fmtTime(dur) : ''}. Видео идёт с Диска прямо в шлем — без скачивания.`;
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const go = document.createElement('button');
+  go.className = 'btn';
+  go.innerHTML = '<svg viewBox="0 0 24 24"><path class="fill" d="M7 4.5v15l13-7.5Z"/></svg><span></span>';
+  go.querySelector('span').textContent = xrSupported ? 'Продолжить в VR' : 'Продолжить';
+  const restart = document.createElement('button');
+  restart.className = 'btn ghost';
+  restart.textContent = 'С начала';
+  const play = (fromStart) => {
+    if (fromStart) LS.del('liquido.pos.' + f.id);
+    if (xrSupported) enterVR();          // вход в VR — внутри жеста пользователя
+    openItem(f);
+  };
+  go.onclick = () => play(false);
+  restart.onclick = () => play(true);
+  actions.append(go, restart);
+  left.append(actions);
+
+  const poster = document.createElement('div');
+  poster.className = 'poster';
+  poster.onclick = () => play(false);
+  const img = new Image();
+  img.alt = '';
+  img.crossOrigin = 'anonymous';
+  img.onerror = () => img.remove();
+  img.src = ownThumbUrl(f);
+  const cap = document.createElement('div');
+  cap.className = 'cap';
+  cap.innerHTML = '<span class="tag">Продолжить</span><span class="fmt"></span>';
+  cap.querySelector('.fmt').textContent = formatLine(fileFormat(f), f.videoMediaMetadata);
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  bar.innerHTML = '<i></i>';
+  bar.firstChild.style.width = dur ? clamp((last.pos / dur) * 100, 2, 100).toFixed(1) + '%' : '0';
+  poster.append(img, cap, bar);
+  hero.append(poster);
 }
 
 async function openItem(f) {
@@ -604,11 +701,11 @@ function buildEnvironment() {
   const cv = document.createElement('canvas');
   cv.width = 8; cv.height = 256;
   const cx = cv.getContext('2d');
-  const g = cx.createLinearGradient(0, 0, 0, 256);
-  g.addColorStop(0, '#16204a');
-  g.addColorStop(0.42, '#0b1026');
-  g.addColorStop(0.52, '#070912');
-  g.addColorStop(1, '#030407');
+  const g = cx.createLinearGradient(0, 0, 0, 256);   // тёплый тёмный зал
+  g.addColorStop(0, '#1c140e');
+  g.addColorStop(0.42, '#120d0a');
+  g.addColorStop(0.52, '#0b0807');
+  g.addColorStop(1, '#050403');
   cx.fillStyle = g;
   cx.fillRect(0, 0, 8, 256);
   const tex = new THREE.CanvasTexture(cv);
@@ -619,33 +716,55 @@ function buildEnvironment() {
   dome.name = 'dome';
   env.add(dome);
   const floor = new THREE.Mesh(new THREE.CircleGeometry(3, 96),
-    new THREE.MeshBasicMaterial({ color: 0x0c1124, transparent: true, opacity: 0.85, depthWrite: false }));
+    new THREE.MeshBasicMaterial({ color: 0x120d09, transparent: true, opacity: 0.85, depthWrite: false }));
   floor.rotation.x = -Math.PI / 2;
   floor.position.y = -1.6;
   floor.renderOrder = -1;
   floor.name = 'floor';
   env.add(floor);
-  if (false) {  // тонкое кольцо пола рябило при поворотах головы — убрано
-  const ring = new THREE.Mesh(new THREE.RingGeometry(2.96, 3.0, 128),
-    new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0.35, depthWrite: false }));
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.y = -1.599;
-  ring.name = 'ring';
-  env.add(ring);
-  // звёзды
-  }
-  if (false) {  // звёзды-точки мерцали при поворотах головы — убраны
-  const pts = [];
-  for (let i = 0; i < 900; i++) {
-    const v = new THREE.Vector3().randomDirection().multiplyScalar(55);
-    if (v.y > -5) pts.push(v);
-  }
-  const stars = new THREE.Points(new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.PointsMaterial({ color: 0x9fb8ff, size: 0.12, transparent: true, opacity: 0.7, depthWrite: false }));
-  stars.name = 'stars';
-  env.add(stars);
-  }
+  // (тонкое кольцо пола и звёзды-точки убраны: мерцали при поворотах головы)
+
+  // Режим «Экран»: мягкое тёплое свечение за экраном (одна плоскость с градиентом — на FPS не влияет)
+  const gc = document.createElement('canvas');
+  gc.width = gc.height = 256;
+  const gx = gc.getContext('2d');
+  const rg = gx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  rg.addColorStop(0, 'rgba(255,181,71,0.18)');
+  rg.addColorStop(0.55, 'rgba(255,181,71,0.07)');
+  rg.addColorStop(1, 'rgba(255,181,71,0)');
+  gx.fillStyle = rg;
+  gx.fillRect(0, 0, 256, 256);
+  const glowTex = new THREE.CanvasTexture(gc);
+  glowTex.colorSpace = THREE.SRGBColorSpace;
+  const glow = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ map: glowTex, transparent: true, depthWrite: false, toneMapped: false }));
+  glow.renderOrder = -1.5;
+  glow.name = 'glow';
+  env.add(glow);
+
+  // «Окно» для XR-слоя: в чёткем режиме экран выводит шлем ПОД нашей сценой, поэтому зал рисуем вокруг,
+  // а на месте экрана делаем прозрачную дыру (пишем альфу 0) — видео видно сквозь неё.
+  const hole = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, blending: THREE.NoBlending, depthWrite: false }));
+  hole.renderOrder = -1.2;
+  hole.name = 'hole';
+  hole.visible = false;
+  env.add(hole);
   return env;
+}
+
+// свечение и «окно» повторяют положение и размер виртуального экрана
+function placeScreenDecor(layerOn) {
+  const glow = scene?.getObjectByName('glow'), hole = scene?.getObjectByName('hole');
+  if (!glow || !hole) return;
+  const flat = effProj() === 'flat';
+  const d = flatDist(state.zoom);
+  glow.visible = flat;
+  glow.position.set(0, state.height, -d - 0.02);
+  glow.scale.set(flatEye.w * 1.9, flatEye.h * 2.2, 1);
+  hole.visible = flat && layerOn;
+  hole.position.set(0, state.height, -d);
+  hole.scale.set(flatEye.w * 1.004, flatEye.h * 1.004, 1);
 }
 
 function initScene() {
@@ -658,7 +777,7 @@ function initScene() {
   $('#stage').prepend(renderer.domElement);
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x030407);
+  scene.background = new THREE.Color(0x050403);
   camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.05, 200);
   camera.layers.enable(1); // вне VR показываем левый глаз
   scene.add(camera);
@@ -675,11 +794,11 @@ function initScene() {
     const c = renderer.xr.getController(i);
     const ray = new THREE.Mesh(
       new THREE.CylinderGeometry(0.0015, 0.004, 1, 8, 1, true).translate(0, 0.5, 0).rotateX(-Math.PI / 2),
-      new THREE.MeshBasicMaterial({ color: 0x7fd8ff, transparent: true, opacity: 0.55, depthWrite: false })
+      new THREE.MeshBasicMaterial({ color: 0xffd9a0, transparent: true, opacity: 0.5, depthWrite: false })
     );
     ray.scale.z = 3;
     const dot = new THREE.Mesh(new THREE.CircleGeometry(0.008, 24),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true }));
+      new THREE.MeshBasicMaterial({ color: 0xffb547, depthTest: false, transparent: true }));
     dot.renderOrder = 1001;
     dot.visible = false;
     c.add(ray);
@@ -828,17 +947,38 @@ function rebuildMedia() {
   baseDirs = projection === 'flat' ? null : Float32Array.from(base.attributes.position.array);
   lastAngle = -1;
   const mat = () => {
-    const m = new THREE.MeshBasicMaterial({ map: videoTex || null, side: THREE.DoubleSide, toneMapped: false, color: videoTex ? 0xffffff : 0x10131c });
+    const m = new THREE.MeshBasicMaterial({ map: videoTex || null, side: THREE.DoubleSide, toneMapped: false, color: videoTex ? 0xffffff : 0x15110d });
     m.onBeforeCompile = (sh) => {
       Object.assign(sh.uniforms, PIC_UNIFORMS);
+      // map_fragment из three r160, но выборка — через liqSample (сглаживание ряби)
+      const mapFrag = THREE.ShaderChunk.map_fragment.replace('texture2D( map, vMapUv )', 'liqSample( vMapUv )');
       sh.fragmentShader = sh.fragmentShader
-        .replace('void main() {', 'uniform float uBright;\nuniform float uContrast;\nuniform float uSat;\nvoid main() {')
-        .replace('#include <map_fragment>', `#include <map_fragment>
+        .replace('void main() {', `uniform float uBright;\nuniform float uContrast;\nuniform float uSat;\nuniform float uAA;
+#ifdef USE_MAP
+// Видео 8K на экране шлема уменьшается, а мип-карт у видео нет: одна выборка «прыгает» между пикселями
+// кадра при малейшем движении головы — мелкие детали мерцают и рябят. Где на пиксель экрана приходится
+// больше одного пикселя видео, усредняем 4 выборки внутри пикселя (rotated grid). Иначе — одна выборка.
+vec4 liqSample( vec2 uv ) {
+  vec4 c = texture2D( map, uv );
+  if ( uAA < 0.5 ) return c;
+  vec2 dx = dFdx( uv ), dy = dFdy( uv );
+  vec2 ts = vec2( textureSize( map, 0 ) );
+  float fp = max( length( dx * ts ), length( dy * ts ) );
+  if ( fp <= 1.0 ) return c;
+  vec4 s = texture2D( map, uv - 0.125 * dx - 0.375 * dy )
+         + texture2D( map, uv + 0.375 * dx - 0.125 * dy )
+         + texture2D( map, uv + 0.125 * dx + 0.375 * dy )
+         + texture2D( map, uv - 0.375 * dx + 0.125 * dy );
+  return mix( c, s * 0.25, clamp( fp - 1.0, 0.0, 1.0 ) );   // плавно: без скачка резкости
+}
+#endif
+void main() {`)
+        .replace('#include <map_fragment>', `${mapFrag}
           diffuseColor.rgb = (diffuseColor.rgb - 0.5) * uContrast + 0.5 + uBright;
           float lum = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
           diffuseColor.rgb = clamp(mix(vec3(lum), diffuseColor.rgb, uSat), 0.0, 1.0);`);
     };
-    m.customProgramCacheKey = () => 'liquido-picture';
+    m.customProgramCacheKey = () => 'liquido-picture-aa';
     return m;
   };
   if (stereo === 'mono') {
@@ -858,6 +998,7 @@ function rebuildMedia() {
   }
   // пол виртуального зала — только для режима «Экран» (в 180/360 он оказался бы поверх видео)
   for (const n of ['floor']) { const o = scene.getObjectByName(n); if (o) o.visible = projection === 'flat'; }
+  placeScreenDecor(layerOnScene);
   updateMipmaps();
   applyZoom();
   updateMediaLayer();
@@ -865,12 +1006,13 @@ function rebuildMedia() {
 }
 
 // ───────── регулировка картинки ─────────
-const PIC_UNIFORMS = { uBright: { value: 0 }, uContrast: { value: 1 }, uSat: { value: 1 } };
+const PIC_UNIFORMS = { uBright: { value: 0 }, uContrast: { value: 1 }, uSat: { value: 1 }, uAA: { value: 1 } };
 const pictureActive = () => ['b', 'c', 's'].some((k) => Math.abs(prefs.picture[k] || 0) > 0.005);
 function applyPicture() {
   PIC_UNIFORMS.uBright.value = (prefs.picture.b || 0) * 0.25;
   PIC_UNIFORMS.uContrast.value = 1 + (prefs.picture.c || 0) * 0.5;
   PIC_UNIFORMS.uSat.value = 1 + (prefs.picture.s || 0);
+  PIC_UNIFORMS.uAA.value = prefs.aa !== false ? 1 : 0;
 }
 applyPicture();
 function setPicture(k, v) {
@@ -888,7 +1030,7 @@ function setPicture(k, v) {
 // Видео отдаётся компоновщику шлема напрямую (без перерисовки через WebGL): чётко и без нагрузки.
 let xrLayersOK = false, mediaBinding = null, mediaLayer = null, mediaLayerKey = '';
 let flatEye = { w: SCREEN_W, h: SCREEN_W * 9 / 16 };
-const BG_COLOR = new THREE.Color(0x030407);
+const BG_COLOR = new THREE.Color(0x050403);
 
 function layerWanted() {
   return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
@@ -896,12 +1038,17 @@ function layerWanted() {
     !(state.view === '2d' && (state.stereo !== 'mono' || state.projection !== 'flat'));
 }
 
+let layerOnScene = false;
 function setSceneForLayer(on) {
   if (!scene) return;
+  layerOnScene = on;
   mediaGroup.visible = !on;
-  for (const n of ['dome', 'stars']) { const o = scene.getObjectByName(n); if (o) o.visible = !on; }
+  // экран (quad-слой): зал остаётся, в нём «окно»; 180/360: купол закрывает всё — зал прячем
+  const keepHall = on && effProj() === 'flat';
+  for (const n of ['dome']) { const o = scene.getObjectByName(n); if (o) o.visible = !on || keepHall; }
   scene.background = on ? null : BG_COLOR;
   renderer.setClearColor(0x000000, on ? 0 : 1);
+  placeScreenDecor(on);
 }
 
 function layerTransform(dist, follow) {
@@ -1017,6 +1164,7 @@ function applyZoom() {
   const z = state.zoom;
   if (effProj() === 'flat') mediaGroup.position.set(0, state.height, -flatDist(z));
   else { mediaGroup.position.set(headLocal.x, headLocal.y + state.height, headLocal.z + zoomOffset(z)); applyAngular(zoomAngle(z)); }
+  placeScreenDecor(layerOnScene);
   updateMipmaps();
   if (renderer?.xr?.isPresenting && layerWanted() !== !!mediaLayer) updateMediaLayer();
   else applyLayerProps();
@@ -1103,17 +1251,32 @@ function setVolume(v) {
 }
 
 // ───────────────────────── VR-интерфейс (рисуется на canvas) ─────────────────────────
-const FONT = 'Manrope, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const FONT = 'Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const DISPLAY = '"Playfair Display", Georgia, serif';
 const C = {
-  bg: 'rgba(12,15,26,0.93)', card: 'rgba(255,255,255,0.07)', hover: 'rgba(255,255,255,0.16)',
-  text: '#eef2ff', muted: '#8e98b3', a1: '#35d0ff', a2: '#8b5cff', warn: '#ffd896',
+  bg: 'rgba(26,23,20,0.96)', card: 'rgba(255,236,210,0.06)', hover: 'rgba(255,236,210,0.14)',
+  text: '#f4ece1', muted: '#a89a88', accent: '#ffb547', onAccent: '#1a1206',
+  line: '#3a332b', curtain: '#b3262d', warn: '#ffd896',
 };
 const rr = (c, x, y, w, h, r) => { c.beginPath(); c.roundRect(x, y, w, h, r); };
-function grad(c, x, y, w) {
-  const g = c.createLinearGradient(x, y, x + w, y);
-  g.addColorStop(0, C.a1); g.addColorStop(1, C.a2);
-  return g;
+// разрядка для надписей в стиле «eyebrow/label»
+function spaced(c, text, x, y, px, align = 'left') {
+  if ('letterSpacing' in c) {
+    c.letterSpacing = Math.round(px * 0.18) + 'px';
+    c.textAlign = align; c.fillText(text, x, y);
+    c.letterSpacing = '0px';
+    return;
+  }
+  c.textAlign = align; c.fillText(text.split('').join(' '), x, y);
 }
+// canvas рисует веб-шрифт, только если он уже загружен (иначе — системный); кириллицу грузим явно
+const fontsReady = (document.fonts ? Promise.all([
+  document.fonts.load(`800 52px ${DISPLAY}`, 'АаЯя Aa'),
+  document.fonts.load(`700 40px ${DISPLAY}`, 'АаЯя Aa'),
+  document.fonts.load(`600 32px ${FONT}`, 'АаЯя Aa 0123'),
+  document.fonts.load(`700 32px ${FONT}`, 'АаЯя Aa 0123'),
+  document.fonts.load(`500 26px ${FONT}`, 'АаЯя Aa'),
+]).catch(() => {}) : Promise.resolve()).then(() => { ui?.redraw(); });
 function ellipsize(c, text, maxW) {
   if (c.measureText(text).width <= maxW) return text;
   let t = text;
@@ -1144,11 +1307,9 @@ class CanvasPanel {
     this.regions = [];
     const c = this.ctx;
     c.clearRect(0, 0, this.W, this.H);
-    rr(c, 4, 4, this.W - 8, this.H - 8, 52);
+    rr(c, 4, 4, this.W - 8, this.H - 8, 24);
     c.fillStyle = C.bg; c.fill();
-    c.strokeStyle = 'rgba(255,255,255,0.10)'; c.lineWidth = 3; c.stroke();
-    c.fillStyle = grad(c, 80, 0, this.W - 160);
-    rr(c, 80, 4, this.W - 160, 5, 3); c.fill();
+    c.strokeStyle = C.line; c.lineWidth = 3; c.stroke();
     c.textBaseline = 'middle';
   }
   end() { this.tex.needsUpdate = true; this.lastDraw = now(); }
@@ -1192,7 +1353,7 @@ function drawIcon(c, name, cx, cy, s, color) {
       c.lineTo(px - nx * h * 0.7, py - ny * h * 0.7);
       c.closePath(); c.fill();
       c.restore();
-      c.font = `800 ${Math.round(u * 0.5)}px ${FONT}`;
+      c.font = `700 ${Math.round(u * 0.5)}px ${FONT}`;
       c.textAlign = 'center'; c.textBaseline = 'middle';
       c.fillText('10', 0, u * 0.04);
       break;
@@ -1234,17 +1395,22 @@ function drawIcon(c, name, cx, cy, s, color) {
   c.restore();
 }
 
+// наведение — янтарное кольцо
+function hoverRing(c, hov) { if (hov) { c.lineWidth = 6; c.strokeStyle = C.accent; c.stroke(); } }
+
 function iconButton(p, id, cx, cy, r, icon, onPress, opts = {}) {
   const c = p.ctx, hov = p.hover === id;
   c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2);
   if (opts.primary) {
-    c.fillStyle = grad(c, cx - r, cy, 2 * r); c.fill();
-    if (hov) { c.lineWidth = 6; c.strokeStyle = 'rgba(255,255,255,0.9)'; c.stroke(); }
+    c.fillStyle = C.accent; c.fill();
+    if (hov) { c.beginPath(); c.arc(cx, cy, r + 9, 0, Math.PI * 2); c.lineWidth = 5; c.strokeStyle = 'rgba(255,181,71,0.55)'; c.stroke(); }
   } else {
-    c.fillStyle = opts.active ? 'rgba(53,208,255,0.25)' : hov ? C.hover : C.card; c.fill();
+    c.fillStyle = opts.active ? 'rgba(255,181,71,0.16)' : hov ? C.hover : C.card; c.fill();
+    c.lineWidth = 3; c.strokeStyle = opts.active ? C.accent : C.line; c.stroke();
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); hoverRing(c, hov);
   }
   const k = opts.primary ? 0.95 : (icon === 'back10' || icon === 'fwd10') ? 1.35 : 0.9;
-  drawIcon(c, icon, cx, cy, r * k, '#fff');
+  drawIcon(c, icon, cx, cy, r * k, opts.primary ? C.onAccent : opts.active ? C.accent : C.text);
   if (opts.label) {
     c.fillStyle = hov ? C.text : C.muted;
     c.font = `600 26px ${FONT}`; c.textAlign = 'center';
@@ -1255,91 +1421,126 @@ function iconButton(p, id, cx, cy, r, icon, onPress, opts = {}) {
 
 function textButton(p, id, x, y, w, h, label, onPress, primary) {
   const c = p.ctx, hov = p.hover === id;
-  rr(c, x, y, w, h, h / 2);
-  c.fillStyle = primary ? grad(c, x, y, w) : hov ? C.hover : C.card; c.fill();
-  if (primary && hov) { c.lineWidth = 5; c.strokeStyle = 'rgba(255,255,255,0.9)'; c.stroke(); }
-  c.fillStyle = '#fff'; c.font = `700 32px ${FONT}`; c.textAlign = 'center';
+  rr(c, x, y, w, h, 16);
+  c.fillStyle = primary ? C.accent : hov ? C.hover : C.card; c.fill();
+  if (!primary) { c.lineWidth = 3; c.strokeStyle = C.line; c.stroke(); }
+  rr(c, x, y, w, h, 16); hoverRing(c, hov);
+  c.fillStyle = primary ? C.onAccent : C.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center';
   c.fillText(ellipsize(c, label, w - 40), x + w / 2, y + h / 2 + 1);
   p.region(id, x, y, w, h, onPress);
 }
 
+// сегменты → «чипы»: отдельные прямоугольники с рамкой, активный — янтарь
 function segmented(p, id, x, y, w, h, options, value, onSelect) {
-  const c = p.ctx;
-  rr(c, x, y, w, h, h / 2); c.fillStyle = 'rgba(255,255,255,0.05)'; c.fill();
-  const sw = w / options.length;
+  const c = p.ctx, GAP = 14;
+  const sw = (w - GAP * (options.length - 1)) / options.length;
   options.forEach(([k, label], i) => {
-    const sx = x + i * sw, rid = id + ':' + k, active = k === value, hov = p.hover === rid;
-    if (active || hov) {
-      rr(c, sx + 6, y + 6, sw - 12, h - 12, (h - 12) / 2);
-      c.fillStyle = active ? grad(c, sx, y, sw) : C.hover; c.fill();
-    }
-    c.fillStyle = active ? '#fff' : C.text;
-    c.font = `${active ? 800 : 600} 32px ${FONT}`; c.textAlign = 'center';
+    const sx = x + i * (sw + GAP), rid = id + ':' + k, active = k === value, hov = p.hover === rid;
+    rr(c, sx, y, sw, h, 16);
+    c.fillStyle = active ? C.accent : hov ? C.hover : 'transparent'; c.fill();
+    if (!active) { c.lineWidth = 3; c.strokeStyle = C.line; c.stroke(); }
+    rr(c, sx, y, sw, h, 16); hoverRing(c, hov && !active);
+    c.fillStyle = active ? C.onAccent : hov ? C.text : C.muted;
+    c.font = `600 30px ${FONT}`; c.textAlign = 'center';
     c.fillText(ellipsize(c, label, sw - 24), sx + sw / 2, y + h / 2 + 1);
     p.region(rid, sx, y, sw, h, () => onSelect(k));
   });
 }
 
+// тонкий трек, янтарное заполнение, бегунок цвета текста
 function slider(p, id, x, y, w, h, v, onChange) {
   const c = p.ctx, hov = p.hover === id, ty = y + h / 2;
-  rr(c, x, ty - 9, w, 18, 9); c.fillStyle = 'rgba(255,255,255,0.12)'; c.fill();
-  rr(c, x, ty - 9, Math.max(18, w * v), 18, 9); c.fillStyle = grad(c, x, ty, w); c.fill();
-  c.beginPath(); c.arc(x + w * v, ty, hov ? 26 : 20, 0, Math.PI * 2);
-  c.fillStyle = '#fff'; c.fill();
+  rr(c, x, ty - 4, w, 8, 4); c.fillStyle = C.line; c.fill();
+  rr(c, x, ty - 4, Math.max(8, w * v), 8, 4); c.fillStyle = C.accent; c.fill();
+  c.beginPath(); c.arc(x + w * v, ty, hov ? 22 : 16, 0, Math.PI * 2);
+  c.fillStyle = C.text; c.fill();
+  if (hov) { c.lineWidth = 5; c.strokeStyle = C.accent; c.stroke(); }
   p.region(id, x, y, w, h, onChange, true);
 }
 
+// Основная панель — «билет»: информация | перфорация | транспорт | перфорация | кнопки
+const TICKET = { W: 2000, H: 320, P1: 640, P2: 1380, NOTCH: 22 };
 function drawMain(p) {
-  const c = p.ctx, W = p.W;
-  p.begin();
-  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `700 40px ${FONT}`;
-  c.fillText(ellipsize(c, current?.name || 'LiquidoVR', W - 600), 60, 66);
-  c.textAlign = 'right'; c.fillStyle = C.muted; c.font = `600 34px ${FONT}`;
-  c.fillText(fmtTime(video.currentTime) + '  /  ' + fmtTime(video.duration), W - 60, 66);
+  const c = p.ctx, W = p.W, H = p.H;
+  p.regions = [];
+  c.clearRect(0, 0, W, H);
+  c.textBaseline = 'middle';
+  // лента с вырезами-перфорацией сверху и снизу
+  rr(c, 4, 4, W - 8, H - 8, 24);
+  c.fillStyle = C.bg; c.fill();
+  c.strokeStyle = C.line; c.lineWidth = 3; c.stroke();
+  c.save();
+  c.globalCompositeOperation = 'destination-out';
+  for (const x of [TICKET.P1, TICKET.P2]) for (const y of [4, H - 4]) {
+    c.beginPath(); c.arc(x, y, TICKET.NOTCH, 0, Math.PI * 2); c.fill();
+  }
+  c.restore();
+  c.strokeStyle = C.line; c.lineWidth = 3;
+  for (const x of [TICKET.P1, TICKET.P2]) {
+    c.beginPath(); c.arc(x, 4, TICKET.NOTCH, 0, Math.PI); c.stroke();
+    c.beginPath(); c.arc(x, H - 4, TICKET.NOTCH, Math.PI, 2 * Math.PI); c.stroke();
+    c.save(); c.setLineDash([14, 12]);
+    c.beginPath(); c.moveTo(x, 4 + TICKET.NOTCH + 14); c.lineTo(x, H - 4 - TICKET.NOTCH - 14); c.stroke();
+    c.restore();
+  }
 
-  // прогресс
-  const bx = 60, by = 128, bw = W - 120, dur = video.duration || 0;
-  const frac = dur ? video.currentTime / dur : 0, hov = p.hover === 'seek';
-  rr(c, bx, by - 8, bw, 16, 8); c.fillStyle = 'rgba(255,255,255,0.12)'; c.fill();
+  // 1) сеанс: формат, название, тех. строка
+  const vm = current?.videoMediaMetadata || { width: video.videoWidth };
+  const LX = 56, LW = TICKET.P1 - LX - 40;
+  c.fillStyle = C.accent; c.font = `600 26px ${FONT}`;
+  spaced(c, ellipsize(c, ('Сеанс · ' + formatLine(state, vm)).toUpperCase(), LW - 40), LX, 100, 26);
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `700 42px ${DISPLAY}`;
+  c.fillText(ellipsize(c, (current?.name || 'LiquidoVR').replace(/\.[a-z0-9]{2,4}$/i, ''), LW), LX, 160);
+  c.fillStyle = C.muted; c.font = `500 24px ${FONT}`;
+  const res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : '—';
+  const sp = (prefs.speed || 1) !== 1 ? ` · ${prefs.speed}×` : '';
+  c.fillText(ellipsize(c, `${res} · ${mediaLayer ? 'XR-слой' : 'рендер ' + QUALITY[prefs.quality].name} · зум ${fmtZoom(state.zoom)}${sp}`, LW), LX, 222);
+
+  // 2) транспорт: ⏮ −10 ▶ +10 ⏭ и прогресс со временем
+  const cx = (TICKET.P1 + TICKET.P2) / 2, cy = 112;
+  iconButton(p, 'prev', cx - 255, cy, 42, 'prev', () => playSibling(-1));
+  iconButton(p, 'back', cx - 135, cy, 52, 'back10', () => seekBy(-10));
+  iconButton(p, 'play', cx, cy, 64, video.paused ? 'play' : 'pause', togglePlay, { primary: true });
+  iconButton(p, 'fwd', cx + 135, cy, 52, 'fwd10', () => seekBy(10));
+  iconButton(p, 'next', cx + 255, cy, 42, 'next', () => playSibling(1));
+
+  const ty = 246, dur = video.duration || 0;
+  const tx0 = TICKET.P1 + 40, tx1 = TICKET.P2 - 40;
+  c.fillStyle = C.muted; c.font = `600 26px ${FONT}`;
+  c.textAlign = 'left'; c.fillText(fmtTime(video.currentTime), tx0, ty);
+  c.textAlign = 'right'; c.fillText(fmtTime(dur), tx1, ty);
+  const bx = tx0 + 100, bw = tx1 - 100 - bx;
+  const frac = dur ? clamp(video.currentTime / dur, 0, 1) : 0, hov = p.hover === 'seek';
+  rr(c, bx, ty - 4, bw, 8, 4); c.fillStyle = C.line; c.fill();
   if (dur) {
-    c.fillStyle = 'rgba(255,255,255,0.16)';
+    c.fillStyle = 'rgba(244,236,225,0.18)';
     for (let i = 0; i < video.buffered.length; i++) {
       const s0 = video.buffered.start(i) / dur, e = video.buffered.end(i) / dur;
-      rr(c, bx + s0 * bw, by - 8, Math.max(0, (e - s0) * bw), 16, 8); c.fill();
+      rr(c, bx + s0 * bw, ty - 4, Math.max(0, (e - s0) * bw), 8, 4); c.fill();
     }
   }
-  rr(c, bx, by - 8, Math.max(16, bw * frac), 16, 8); c.fillStyle = grad(c, bx, by, bw); c.fill();
-  c.beginPath(); c.arc(bx + bw * frac, by, hov ? 22 : 15, 0, Math.PI * 2); c.fillStyle = '#fff'; c.fill();
-  p.region('seek', bx, by - 42, bw, 84, (fx) => { if (dur) video.currentTime = fx * dur; }, true);
+  rr(c, bx, ty - 4, Math.max(8, bw * frac), 8, 4); c.fillStyle = C.accent; c.fill();
+  c.beginPath(); c.arc(bx + bw * frac, ty, hov ? 20 : 14, 0, Math.PI * 2); c.fillStyle = C.text; c.fill();
+  if (hov) { c.lineWidth = 5; c.strokeStyle = C.accent; c.stroke(); }
+  p.region('seek', bx - 10, ty - 44, bw + 20, 88, (fx) => { if (dur) video.currentTime = clamp((fx * (bw + 20) - 10) / bw, 0, 1) * dur; }, true);
 
-  // центр: предыдущее, −10, пауза, +10, следующее
-  const cy = 268, cx = W / 2;
-  iconButton(p, 'prev', cx - 340, cy, 48, 'prev', () => playSibling(-1));
-  iconButton(p, 'back', cx - 190, cy, 64, 'back10', () => seekBy(-10));
-  iconButton(p, 'play', cx, cy, 86, video.paused ? 'play' : 'pause', togglePlay, { primary: true });
-  iconButton(p, 'fwd', cx + 190, cy, 64, 'fwd10', () => seekBy(10));
-  iconButton(p, 'next', cx + 340, cy, 48, 'next', () => playSibling(1));
-
-  // слева: текущий формат (открывает настройки)
-  const chip = `${PROJ_NAME[state.projection]} · ${state.stereo === 'mono' ? '2D' : state.stereo.toUpperCase()}`;
-  textButton(p, 'view', 60, cy - 46, 150, 92, state.view === '2d' ? '2D' : '3D', () => setFormat({ view: state.view === '2d' ? '3d' : '2d' }), true);
-  textButton(p, 'fmt', 226, cy - 46, 280, 92, chip, () => ui.openSettings(true));
-  c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `600 24px ${FONT}`;
-  const res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : '—';
-  const sp = (prefs.speed || 1) !== 1 ? `  ·  ${prefs.speed}×` : '';
-  c.fillText(`${res}  ·  ${mediaLayer ? 'XR-слой' : QUALITY[prefs.quality].name}  ·  Зум ${fmtZoom(state.zoom)}${sp}`, 72, cy + 80);
-
-  // справа: библиотека, настройки, центр, выход
-  iconButton(p, 'library', W - 460, cy, 54, 'grid', () => ui.openLibrary(), { active: ui.sheet === 'library' });
-  iconButton(p, 'settings', W - 340, cy, 54, 'gear', () => ui.openSettings(), { active: ui.sheet === 'settings' });
-  iconButton(p, 'center', W - 220, cy, 54, 'center', recenter);
-  iconButton(p, 'exit', W - 100, cy, 54, 'exit', () => renderer.xr.getSession()?.end());
+  // 3) режим и формат, ниже — библиотека, настройки, центр, выход
+  const RX = TICKET.P2 + 44;
+  textButton(p, 'view', RX, cy - 46, 136, 92, state.view === '2d' ? '2D' : '3D',
+    () => setFormat({ view: state.view === '2d' ? '3d' : '2d' }), state.view !== '2d');
+  textButton(p, 'fmt', RX + 152, cy - 46, W - 56 - (RX + 152), 92,
+    `${PROJ_NAME[state.projection]} · ${state.stereo === 'mono' ? '2D' : state.stereo.toUpperCase()}`, () => ui.openSettings(true));
+  const by = 246, step = 128;
+  iconButton(p, 'library', RX + 46, by, 46, 'grid', () => ui.openLibrary(), { active: ui.sheet === 'library' });
+  iconButton(p, 'settings', RX + 46 + step, by, 46, 'gear', () => ui.openSettings(), { active: ui.sheet === 'settings' });
+  iconButton(p, 'center', RX + 46 + step * 2, by, 46, 'center', recenter);
+  iconButton(p, 'exit', RX + 46 + step * 3, by, 46, 'exit', () => renderer.xr.getSession()?.end());
   p.end();
 }
 
 function sheetHeader(p, title, extra) {
   const c = p.ctx, W = p.W;
-  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 50px ${FONT}`;
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 52px ${DISPLAY}`;
   c.fillText(title, 64, 84);
   iconButton(p, 'close', W - 96, 84, 46, 'close', () => { ui.sheet = null; ui.setVisible(true); });
   if (extra) extra();
@@ -1348,9 +1549,9 @@ function sheetHeader(p, title, extra) {
 function valueSlider(p, id, x, y, w, h, v01, text, onChange, step) {
   const c = p.ctx;
   iconButton(p, id + '-', x + 46, y + h / 2, 44, 'minus', () => onChange(clamp(v01 - step, 0, 1)));
-  slider(p, id, x + 120, y, w - 380, h, v01, onChange);
+  slider(p, id, x + 130, y, w - 420, h, v01, onChange);
   iconButton(p, id + '+', x + w - 214, y + h / 2, 44, 'plus', () => onChange(clamp(v01 + step, 0, 1)));
-  c.textAlign = 'right'; c.fillStyle = C.text; c.font = `800 34px ${FONT}`;
+  c.textAlign = 'right'; c.fillStyle = C.text; c.font = `700 32px ${FONT}`;
   c.fillText(text, x + w, y + h / 2);
 }
 
@@ -1365,7 +1566,7 @@ function drawSettings(p) {
   });
   const LX = 64, CX = 430, CW = W - CX - 64, RH = 92, STEP = 120;
   let y = 170;
-  const label = (t) => { c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `700 32px ${FONT}`; c.fillText(t, LX, y + RH / 2); };
+  const label = (t) => { c.fillStyle = C.muted; c.font = `600 24px ${FONT}`; spaced(c, t.toUpperCase(), LX, y + RH / 2, 24); };
   const note = (t) => { c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `500 26px ${FONT}`; c.fillText(t, LX, y + 30); };
 
   if (ui.tab === 'video') {
@@ -1440,6 +1641,12 @@ function drawSettings(p) {
       ui.toastMsg(prefs.layers ? (mediaLayer ? 'Чёткий режим включён' : 'XR-слой недоступен для этого формата/настроек') : 'Совместимый режим');
     });
     y += STEP;
+    label('Сглаживание');
+    segmented(p, 'aa', CX, y, CW, RH, [['on', 'Без ряби (мягче)'], ['off', 'Выключено (резче)']], prefs.aa !== false ? 'on' : 'off', (k) => {
+      prefs.aa = k === 'on'; savePrefs(); applyPicture();
+      ui.toastMsg(mediaLayer ? 'Сглаживание работает в режиме «Совместимый»' : prefs.aa ? 'Сглаживание включено' : 'Сглаживание выключено');
+    });
+    y += STEP;
     label('Следующее видео');
     segmented(p, 'autonext', CX, y, CW, RH, [['on', 'Включать автоматически'], ['off', 'Не включать']], prefs.autoNext ? 'on' : 'off', (k) => {
       prefs.autoNext = k === 'on'; savePrefs();
@@ -1451,7 +1658,7 @@ function drawSettings(p) {
 }
 
 function drawFolderIcon(c, cx, cy, s) {
-  c.fillStyle = 'rgba(155,231,255,0.85)';
+  c.fillStyle = C.accent;
   rr(c, cx - s, cy - s * 0.55, s * 0.9, s * 0.3, s * 0.08); c.fill();
   rr(c, cx - s, cy - s * 0.4, s * 2, s * 1.2, s * 0.12); c.fill();
 }
@@ -1469,7 +1676,7 @@ function drawLibrary(p) {
       });
       x = 180;
     }
-    c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 46px ${FONT}`;
+    c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 48px ${DISPLAY}`;
     c.fillText(ellipsize(c, folder, W - x - 200), x, 84);
   });
 
@@ -1486,12 +1693,12 @@ function drawLibrary(p) {
   pageItems.forEach((f, i) => {
     const x = 64 + (i % COLS) * (tw + GAP), y = 160 + Math.floor(i / COLS) * (tileH + GAP);
     const id = 'lib:' + f.id, hov = p.hover === id, isCur = f.id === current?.id;
-    rr(c, x, y, tw, tileH, 22);
+    rr(c, x, y, tw, tileH, 16);
     c.fillStyle = hov ? C.hover : C.card; c.fill();
-    if (isCur) { c.lineWidth = 5; c.strokeStyle = C.a1; c.stroke(); }
+    c.lineWidth = isCur || hov ? 5 : 3; c.strokeStyle = isCur || hov ? C.accent : C.line; c.stroke();
     c.save();
-    rr(c, x, y, tw, th, 22); c.clip();
-    c.fillStyle = '#0b0f1d'; c.fillRect(x, y, tw, th);
+    rr(c, x, y, tw, th, 16); c.clip();
+    c.fillStyle = '#15110d'; c.fillRect(x, y, tw, th);
     if (f.mimeType === FOLDER) drawFolderIcon(c, x + tw / 2, y + th / 2, 46);
     else {
       const img = vrThumb(f);
@@ -1499,18 +1706,20 @@ function drawLibrary(p) {
         const k = Math.max(tw / img.naturalWidth, th / img.naturalHeight);
         const iw = img.naturalWidth * k, ih = img.naturalHeight * k;
         c.drawImage(img, x + (tw - iw) / 2, y + (th - ih) / 2, iw, ih);
-      } else drawIcon(c, 'play', x + tw / 2, y + th / 2, 60, 'rgba(255,255,255,0.3)');
+      } else drawIcon(c, 'play', x + tw / 2, y + th / 2, 60, 'rgba(244,236,225,0.25)');
       const d = f.videoMediaMetadata?.durationMillis;
       if (d) {
         const t = fmtTime(d / 1000);
         c.font = `700 24px ${FONT}`;
         const w2 = c.measureText(t).width + 24;
-        rr(c, x + tw - w2 - 10, y + th - 44, w2, 34, 17); c.fillStyle = 'rgba(0,0,0,0.7)'; c.fill();
-        c.fillStyle = '#fff'; c.textAlign = 'center'; c.fillText(t, x + tw - w2 / 2 - 10, y + th - 27);
+        rr(c, x + tw - w2 - 10, y + th - 44, w2, 34, 6); c.fillStyle = 'rgba(15,13,11,0.72)'; c.fill();
+        c.fillStyle = C.text; c.textAlign = 'center'; c.fillText(t, x + tw - w2 / 2 - 10, y + th - 27);
       }
+      const pos = LS.get('liquido.pos.' + f.id, 0);
+      if (pos > 0 && d) { c.fillStyle = C.accent; c.fillRect(x, y + th - 6, tw * clamp(pos / (d / 1000), 0.02, 1), 6); }
     }
     c.restore();
-    c.textAlign = 'left'; c.fillStyle = isCur ? C.a1 : C.text; c.font = `700 26px ${FONT}`;
+    c.textAlign = 'left'; c.fillStyle = isCur ? C.accent : C.text; c.font = `700 28px ${DISPLAY}`;
     c.fillText(ellipsize(c, f.name, tw - 28), x + 16, y + th + 40);
     p.region(id, x, y, tw, tileH, () => {
       if (f.mimeType === FOLDER) { nav.stack.push({ id: f.id, name: f.name }); ui.libPage = 0; loadList(true); ui.redraw(); }
@@ -1540,12 +1749,12 @@ function drawPair(p) {
 
   // поле ввода
   const val = mode === 'pin' ? (st.pin || '') : (st.ip || '');
-  rr(c, 64, 260, 700, 110, 24); c.fillStyle = 'rgba(255,255,255,0.06)'; c.fill();
-  c.strokeStyle = 'rgba(53,208,255,0.5)'; c.lineWidth = 3; c.stroke();
-  c.textAlign = 'center'; c.fillStyle = C.text; c.font = `800 60px ${FONT}`;
+  rr(c, 64, 260, 700, 110, 16); c.fillStyle = C.card; c.fill();
+  c.strokeStyle = C.accent; c.lineWidth = 3; c.stroke();
+  c.textAlign = 'center'; c.fillStyle = C.text; c.font = `700 60px ${FONT}`;
   c.fillText(mode === 'pin' ? (val.padEnd(6, '·').split('').join(' ')) : (val || '192.168.…'), 64 + 350, 318);
   if (st.error) { c.textAlign = 'left'; c.fillStyle = C.warn; c.font = `700 30px ${FONT}`; c.fillText(st.error, 64, 420); }
-  if (st.busy) { c.textAlign = 'left'; c.fillStyle = C.a1; c.font = `700 30px ${FONT}`; c.fillText('Подключаюсь…', 64, 420); }
+  if (st.busy) { c.textAlign = 'left'; c.fillStyle = C.accent; c.font = `700 30px ${FONT}`; c.fillText('Подключаюсь…', 64, 420); }
 
   // кнопки действий слева
   const setVal = (v) => { if (mode === 'pin') st.pin = v; else st.ip = v; ui.redraw(); };
@@ -1594,10 +1803,10 @@ function vrThumb(f) {
 function drawToast(p, text, warn) {
   const c = p.ctx;
   c.clearRect(0, 0, p.W, p.H);
-  rr(c, 4, 4, p.W - 8, p.H - 8, (p.H - 8) / 2);
-  c.fillStyle = 'rgba(12,15,26,0.92)'; c.fill();
-  c.strokeStyle = warn ? 'rgba(255,216,150,0.5)' : 'rgba(53,208,255,0.45)'; c.lineWidth = 3; c.stroke();
-  c.fillStyle = warn ? C.warn : C.text; c.font = `700 40px ${FONT}`;
+  rr(c, 4, 4, p.W - 8, p.H - 8, 20);
+  c.fillStyle = C.bg; c.fill();
+  c.strokeStyle = warn ? 'rgba(255,216,150,0.5)' : C.line; c.lineWidth = 3; c.stroke();
+  c.fillStyle = warn ? C.warn : C.text; c.font = `600 40px ${FONT}`;
   c.textAlign = 'center'; c.textBaseline = 'middle';
   c.fillText(ellipsize(c, text, p.W - 80), p.W / 2, p.H / 2 + 1);
   p.end();
@@ -1605,9 +1814,9 @@ function drawToast(p, text, warn) {
 
 class VRUI {
   constructor(parent) {
-    this.main = new CanvasPanel(1800, 400, 1.35);
+    this.main = new CanvasPanel(TICKET.W, TICKET.H, 1.45);   // лента-«билет» под экраном
     this.main.draw = () => drawMain(this.main);
-    this.main.mesh.position.set(0, -0.5, -1.15);
+    this.main.mesh.position.set(0, -0.48, -1.15);
     this.main.mesh.rotation.x = -0.42;
     this.settings = new CanvasPanel(1600, 1180, 1.2);
     this.settings.draw = () => drawSettings(this.settings);
@@ -1673,8 +1882,16 @@ class VRUI {
     if (this.visible && !video.paused && !this.sheet && t - this.lastActivity > 6000) {
       this.setVisible(false); // автоскрытие во время просмотра
     } else if (this.visible && t - this.main.lastDraw > 250) {
-      this.main.draw();
-      if (this.settings.mesh.visible) this.settings.draw();
+      // перерисовываем (и заново отправляем текстуру в GPU) только если что-то изменилось:
+      // постоянная перезаливка больших canvas-текстур давала рывки кадров
+      const dur = video.duration || 0;
+      const buf = video.buffered.length ? Math.round(video.buffered.end(video.buffered.length - 1)) : 0;
+      const mk = [Math.floor(video.currentTime), video.paused, buf, video.videoWidth, !!mediaLayer].join('|');
+      if (mk !== this.mainKey) { this.mainKey = mk; this.main.draw(); } else this.main.lastDraw = t;
+      if (this.settings.mesh.visible) {
+        const sk = [video.volume.toFixed(2), state.zoom.toFixed(2), state.height, prefs.speed, dur > 0].join('|');
+        if (sk !== this.settingsKey) { this.settingsKey = sk; this.settings.draw(); }
+      }
     }
   }
 }
@@ -1849,8 +2066,12 @@ function startVideo(src, resumeAt) {
 function savePosition() {
   if (!current || !isFinite(video.duration) || String(current.id).startsWith('demo:')) return;
   const t = video.currentTime;
-  if (t > 10 && t < video.duration - 15) LS.set('liquido.pos.' + current.id, t);
-  else LS.del('liquido.pos.' + current.id);
+  if (t > 10 && t < video.duration - 15) {
+    LS.set('liquido.pos.' + current.id, t);
+    // для героя «Продолжить»: что смотрели последним (позиция — в liquido.pos.<id>)
+    const { id, name, size, mimeType, thumbnailLink, videoMediaMetadata } = current;
+    LS.set('liquido.last', { f: { id, name, size, mimeType, thumbnailLink, videoMediaMetadata } });
+  } else LS.del('liquido.pos.' + current.id);
   saveFormat();
 }
 
@@ -1913,6 +2134,7 @@ function showBrowser() {
   $('#viewPlayer').hidden = true;
   $('#viewBrowser').hidden = false;
   stageMsg('');
+  renderHero();
 }
 
 function paintRange(el) {
@@ -1951,6 +2173,8 @@ function syncControls() {
   $('#cPlay').innerHTML = video.paused ? ICONS.play : ICONS.pause;
   setSegmented($('#segProj'), state.projection);
   setSegmented($('#segStereo'), state.stereo);
+  setSegmented($('#segQuality'), prefs.quality);
+  $('#nowFmt').textContent = 'Сеанс · ' + formatLine(state, current?.videoMediaMetadata || { width: video.videoWidth });
   $('#cSwap').checked = state.swap;
   $('#cVol').value = Math.round(video.volume * 100);
   paintRange($('#cVol'));
@@ -1977,7 +2201,10 @@ function enterVR() {
   }
   initScene();
   if (renderer.xr.isPresenting) return Promise.resolve(true);
-  renderer.xr.setFramebufferScaleFactor(QUALITY[prefs.quality].scale);
+  // В чётком режиме (XR-слой) видео выводит сам шлем, а WebGL рисует только интерфейс.
+  // Огромный буфер ×1.5 при этом только нагружает GPU: пропуски кадров → рывки и «двоение» (репроекция).
+  const q = QUALITY[prefs.quality].scale;
+  renderer.xr.setFramebufferScaleFactor(prefs.layers !== false ? Math.min(q, 1.2) : q);
   // requestSession вызывается синхронно внутри жеста пользователя
   return navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'layers'] })
     .then(async (session) => {
@@ -2011,6 +2238,7 @@ function bindUI() {
     e.preventDefault();
     const q = $('#searchInput').value.trim();
     if (!q) return;
+    if (/drive\.google\.com|docs\.google\.com/.test(q)) { openLink(q); return; }  // вставили ссылку Диска
     setActiveTab(null);
     nav.source = 'search'; nav.query = q; nav.stack = [];
     loadList(true);
@@ -2030,6 +2258,9 @@ function bindUI() {
   });
   buildSegmented($('#segProj'), PROJ.map((k) => [k, PROJ_NAME[k]]), (k) => setFormat({ projection: k }));
   buildSegmented($('#segStereo'), STEREO.map((k) => [k, STEREO_NAME[k]]), (k) => setFormat({ stereo: k }));
+  buildSegmented($('#segQuality'), QUALITY_KEYS.map((k) => [k, QUALITY[k].name]), (k) => {
+    prefs.quality = k; savePrefs(); syncPrefsUI(); syncControls(); rebuildMedia();
+  });
   $('#cSwap').onchange = (e) => setFormat({ swap: e.target.checked });
   $('#cZoom').oninput = (e) => { setZoom(e.target.value / 100); saveFormat(); };
   $('#cVol').oninput = (e) => setVolume(e.target.value / 100);
@@ -2061,12 +2292,18 @@ async function init() {
   bindUI();
   updateAuthUI();
   syncPrefsUI();
+  renderHero();
+  // отладка на ПК: ?debug — доступ к VR-панелям из консоли (отрисовка без шлема)
+  if (new URLSearchParams(location.search).has('debug')) {
+    window.__liquido = { get ui() { return ui; }, state, setFormat, setZoom, initScene, fontsReady };
+  }
   if (!window.isSecureContext) {
     banner('Откройте плеер по адресу http://localhost:8080 или через приложение LiquidoVR. По IP-адресу VR и поток работать не будут.');
   }
   try {
     xrSupported = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-vr');
   } catch { xrSupported = false; }
+  renderHero();
   // В приложении LiquidoVR (Quest) сразу входим в VR и открываем библиотеку:
   // запуск по иконке считается действием пользователя для requestSession.
   if (IS_APP && xrSupported && !new URLSearchParams(location.search).get('demo')) {
