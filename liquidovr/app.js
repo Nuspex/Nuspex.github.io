@@ -1472,119 +1472,10 @@ function updateMipmaps() {
     (domeAway() || (effProj() === 'flat' && flatDist(state.zoom) > 3));
   if (on === mipOn) return;
   mipOn = on;
-  for (const t of gate.a ? [gate.a, gate.b] : [videoTex]) {
-    t.generateMipmaps = on;
-    t.minFilter = on ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
-    t.anisotropy = on ? (renderer.capabilities.getMaxAnisotropy() || 1) : 1;
-    t.needsUpdate = true;
-  }
-}
-
-// ── Атомарное обновление видеотекстуры (WebGL-вывод; XR media-layer остаётся приоритетным) ──
-// Видеодекодер владеет surface, пока браузер выдаёт decoded frame. Поэтому WebGL никогда не
-// загружает живой <video> напрямую: callback сначала делает стабильный snapshot, а render loop
-// загружает snapshot только в заднюю текстуру. Передняя текстура меняется лишь после staging render.
-const gate = {
-  a: null, b: null, front: null, rt: null, scene: null, cam: null, quad: null,
-  pending: null, pendingMeta: null, uploading: false, cb: 0, source: 0
-};
-function makeVidTex() {
-  // Placeholder задаёт валидный размер с самого начала. Это исключает texImage2D(0, 0, ...)
-  // при первом кадре и не использует video.width (HTML layout width может быть 0).
-  const placeholder = document.createElement('canvas');
-  placeholder.width = placeholder.height = 2;
-  const cx = placeholder.getContext('2d');
-  cx.fillStyle = '#111'; cx.fillRect(0, 0, 2, 2);
-  const t = new THREE.Texture(placeholder);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.minFilter = THREE.LinearFilter;
-  t.magFilter = THREE.LinearFilter;
-  t.generateMipmaps = false;
-  t.needsUpdate = true;
-  // Не помечаем snapshot-текстуру как VideoTexture: three.js иначе вызывает updateVideoTexture
-  // непосредственно во время основного render и снова читает decoder-owned surface.
-  t.isVideoTexture = false;
-  return t;
-}
-function closeFrame(frame) {
-  try { frame?.close?.(); } catch { /* ImageBitmap may already be closed */ }
-}
-function gateInvalidate() {
-  gate.source++;
-  closeFrame(gate.pending);
-  gate.pending = gate.pendingMeta = null;
-}
-function gateDispose() {
-  gate.cb++;
-  gateInvalidate();
-  gate.uploading = false;
-  for (const t of [gate.a, gate.b]) t?.dispose();
-  gate.rt?.dispose();
-  gate.a = gate.b = gate.front = gate.rt = null;
-}
-function gateInit() {
-  gateDispose();
-  if (videoTex && !gate.a) videoTex.dispose?.();
-  gate.a = makeVidTex(); gate.b = makeVidTex(); gate.front = gate.a;
-  videoTex = gate.front;
-  if (!gate.scene) {
-    gate.scene = new THREE.Scene();
-    gate.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-    gate.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ toneMapped: false }));
-    gate.scene.add(gate.quad);
-  }
-  gate.rt = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false, stencilBuffer: false });
-  const id = ++gate.cb;
-  const step = (_, meta) => {
-    if (id !== gate.cb) return;
-    gateCapture(meta, gate.source, id).catch((e) => console.warn('video frame snapshot', e));
-    video.requestVideoFrameCallback(step);
-  };
-  video.requestVideoFrameCallback(step);
-}
-async function gateCapture(meta, source, id) {
-  if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
-  const frame = typeof createImageBitmap === 'function'
-    ? await createImageBitmap(video)
-    : (() => {
-        const c = document.createElement('canvas');
-        c.width = video.videoWidth; c.height = video.videoHeight;
-        c.getContext('2d').drawImage(video, 0, 0);
-        return c;
-      })();
-  // A seek/source switch may finish after this callback started. Never enqueue stale frames.
-  if (id !== gate.cb || source !== gate.source || video.readyState < 2) { closeFrame(frame); return; }
-  closeFrame(gate.pending);
-  gate.pending = frame;
-  gate.pendingMeta = meta || null;
-}
-function gateCommit() {
-  if (!renderer || !gate.a || !gate.pending || gate.uploading || !mediaGroup?.visible || video.readyState < 2) return;
-  const frame = gate.pending;
-  gate.pending = gate.pendingMeta = null;
-  const back = gate.front === gate.a ? gate.b : gate.a;
-  gate.uploading = true;
-  try {
-    // Texture upload occurs only here, before the main scene render, while back is not sampled.
-    back.image = frame;
-    back.needsUpdate = true;
-    gate.quad.material.map = back;
-    const xrOn = renderer.xr.enabled;
-    renderer.xr.enabled = false;
-    const prevRT = renderer.getRenderTarget();
-    renderer.setRenderTarget(gate.rt);
-    renderer.render(gate.scene, gate.cam);
-    renderer.setRenderTarget(prevRT);
-    renderer.xr.enabled = xrOn;
-    gate.front = back;
-    videoTex = back;
-    for (const m of mediaGroup.children) if (m.material?.map) m.material.map = back;
-  } catch (e) {
-    console.warn('video texture staging', e);
-  } finally {
-    gate.uploading = false;
-    closeFrame(frame);
-  }
+  videoTex.generateMipmaps = on;
+  videoTex.minFilter = on ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  videoTex.anisotropy = on ? (renderer.capabilities.getMaxAnisotropy() || 1) : 1;
+  videoTex.needsUpdate = true;
 }
 
 function applyZoom() {
@@ -1649,8 +1540,8 @@ function recenter() {
 const seekStep = () => (SEEK_STEPS.includes(prefs.seekStep) ? prefs.seekStep : 10);
 const fisheyeFov = () => state.fisheyeFov || prefs.fisheyeFov || 180;
 function seekBy(d) {
-  if (!isFinite(video.duration) || video.duration <= 0) return;
-  video.currentTime = clamp(video.currentTime + d, 0, Math.max(0, video.duration - 0.5));
+  if (!isFinite(video.duration)) return;
+  video.currentTime = clamp(video.currentTime + d, 0, video.duration - 0.5);
 }
 function togglePlay() {
   pbToken++;                       // пользователь сам нажал — отменяем ожидание предзагрузки
@@ -2585,8 +2476,6 @@ function handleGamepads(dt) {
 
 const clock = new THREE.Clock();
 function renderFrame() {
-  // Commit at the render boundary: materials never observe a texture while it is being uploaded.
-  gateCommit();
   const dt = Math.min(clock.getDelta(), 0.1);
   if (renderer.xr.isPresenting) {
     if (recenterFrames > 0 && --recenterFrames === 0) recenter();
@@ -2626,7 +2515,6 @@ async function playFile(f) {
 
 function startVideo(src, resumeAt) {
   initScene();
-  gateInvalidate();
   stageMsg('Загрузка потока…');
   video.volume = prefs.volume;
   layerRetries = 0;
@@ -2654,15 +2542,12 @@ function savePosition() {
 }
 
 video.addEventListener('loadedmetadata', () => {
-  if ('requestVideoFrameCallback' in video) gateInit();   // атомарная смена кадров (см. gateFrame)
-  else {
-    if (videoTex) videoTex.dispose();
-    videoTex = new THREE.VideoTexture(video);
-    videoTex.colorSpace = THREE.SRGBColorSpace;
-    videoTex.minFilter = THREE.LinearFilter;
-    videoTex.magFilter = THREE.LinearFilter;
-    videoTex.generateMipmaps = false;
-  }
+  if (videoTex) videoTex.dispose();
+  videoTex = new THREE.VideoTexture(video);
+  videoTex.colorSpace = THREE.SRGBColorSpace;
+  videoTex.minFilter = THREE.LinearFilter;
+  videoTex.magFilter = THREE.LinearFilter;
+  videoTex.generateMipmaps = false;
   mipOn = null;
   rebuildMedia();
   const r = Number(video.dataset.resume) || 0;
@@ -2693,9 +2578,7 @@ function bufferingOff() {
   bufShown = false;
 }
 video.addEventListener('waiting', bufferingOn);
-video.addEventListener('stalled', bufferingOn);
 video.addEventListener('seeking', () => {
-  gateInvalidate();
   if (!video.paused || pbActive) { seekWasPlaying = true; if (!video.paused) bufferingOn(); }
 });
 video.addEventListener('seeked', () => {
@@ -2723,12 +2606,11 @@ async function prebufferThenPlay(targetSec, maxWaitMs) {
     if (now() - t0 > maxWaitMs) break;               // медленная сеть — не ждём бесконечно
     await new Promise((r) => setTimeout(r, 150));
   }
-  if (my !== pbToken) { pbActive = false; return; }  // пользователь нажал паузу/пуск сам
+  if (my !== pbToken) return;                         // пользователь нажал паузу/пуск сам
   pbActive = false;
   video.play().catch(() => stageMsg('Нажмите ▶ для запуска'));
 }
 for (const ev of ['playing', 'canplay', 'pause', 'emptied', 'ended']) video.addEventListener(ev, bufferingOff);
-video.addEventListener('emptied', gateInvalidate);
 video.addEventListener('play', syncControls);
 video.addEventListener('pause', () => { syncControls(); savePosition(); });
 video.addEventListener('timeupdate', () => {
@@ -2991,7 +2873,7 @@ async function init() {
     $('#nowTitle').textContent = current.name + ' (демо)';
     currentSrc = demo;
     startVideo(demo, 0);
-    window.__liquido = { ui, state, setFormat, setZoom, setPitch: (v) => { pitch = v; }, gate }; // отладка
+    window.__liquido = { ui, state, setFormat, setZoom, setPitch: (v) => { pitch = v; } }; // отладка
     return;
   }
 
