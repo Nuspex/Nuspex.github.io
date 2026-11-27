@@ -1,1 +1,176 @@
-<!doctype html><meta charset="utf-8"><title>LiquidoVR</title><meta http-equiv="refresh" content="0; url=liquidovr/"><a href="liquidovr/">LiquidoVR</a>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiquidoVR</title>
+  <meta name="theme-color" content="#0f0d0b">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/logo.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="appbar">
+    <a class="logo" href="./" aria-label="LiquidoVR — на главную">
+      <i class="logo-dot" aria-hidden="true"></i>
+      <span>LiquidoVR</span>
+    </a>
+    <nav class="tabs" role="tablist" aria-label="Источник">
+      <button data-src="root" class="active">Мой диск</button>
+      <button data-src="shared">Доступные мне</button>
+      <button data-src="recent">Недавние</button>
+    </nav>
+    <div class="appbar-right">
+      <form id="searchForm" class="search" role="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="searchInput" placeholder="Найти видео или вставить ссылку" autocomplete="off" aria-label="Поиск или ссылка Google Диска">
+      </form>
+      <span id="who" class="pill"></span>
+      <button id="btnInstall" class="btn ghost small" hidden>Установить приложение</button>
+      <button id="btnLogin" class="btn ghost small">Проверить подключение</button>
+      <button id="btnPrefs" class="icon-btn" title="Настройки" aria-label="Настройки">
+        <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden><span id="bannerText"></span><button id="bannerBtn" class="btn small" hidden></button></div>
+
+  <main>
+    <!-- Библиотека -->
+    <section id="viewBrowser">
+      <!-- «Продолжить»: заполняется из app.js (renderHero) -->
+      <div id="hero" class="hero"></div>
+
+      <div class="subbar">
+        <h2 id="folderTitle">Мой диск</h2>
+        <div class="subbar-right">
+          <nav id="crumbs" aria-label="Путь"></nav>
+          <span id="listCount" class="count"></span>
+          <label class="switch"><input type="checkbox" id="showAll"><span></span>Все файлы</label>
+          <details class="linkbox">
+            <summary>Открыть по ссылке</summary>
+            <form id="linkForm">
+              <input id="linkInput" placeholder="https://drive.google.com/…" autocomplete="off">
+              <button class="btn small">Открыть</button>
+            </form>
+          </details>
+        </div>
+      </div>
+
+      <div id="list" class="grid"></div>
+      <div id="listStatus" class="status"></div>
+      <button id="btnMore" class="btn ghost more" hidden>Показать ещё</button>
+    </section>
+
+    <!-- Плеер -->
+    <section id="viewPlayer" hidden>
+      <div class="player-head">
+        <button id="btnBack" class="btn ghost small">← Библиотека</button>
+        <div id="nowTitle"></div>
+        <span id="nowFmt" class="eyebrow"></span>
+        <button id="btnFull" class="btn ghost small" title="На весь экран (F, двойной клик)">
+          <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><span>На весь экран</span>
+        </button>
+      </div>
+
+      <div id="stage">
+        <video id="video" playsinline preload="auto"></video>
+        <div class="fs-top"><span id="fsFmt" class="eyebrow"></span><div id="fsTitle"></div></div>
+        <div id="stageMsg"></div>
+        <button id="btnVR" class="vr-cta">
+          <svg viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4l-2-3h-2l-2 3H5a2 2 0 0 1-2-2Z"/><circle cx="8" cy="11.5" r="1.6"/><circle cx="16" cy="11.5" r="1.6"/></svg>
+          <span>Смотреть в VR</span>
+        </button>
+      </div>
+
+      <div class="transport panel">
+        <button id="cBack" class="icon-btn" title="−10 с" aria-label="Назад 10 секунд">
+          <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+        </button>
+        <button id="cPlay" class="play-btn" title="Пауза/пуск" aria-label="Пауза или пуск"></button>
+        <button id="cFwd" class="icon-btn" title="+10 с" aria-label="Вперёд 10 секунд">
+          <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
+        </button>
+        <span id="cTimeCur" class="time">0:00</span>
+        <input type="range" id="cSeek" min="0" max="1000" value="0" aria-label="Позиция">
+        <span id="cTime" class="time">0:00</span>
+        <button id="cMute" class="icon-btn" title="Звук (M)" aria-label="Звук"></button>
+        <input type="range" id="cVolT" class="vol" min="0" max="100" value="100" aria-label="Громкость">
+        <button id="cFull" class="icon-btn" title="На весь экран (F)" aria-label="На весь экран"></button>
+      </div>
+
+      <div class="formats panel">
+        <div class="field">
+          <span class="label">Проекция</span>
+          <div class="chips" id="segProj"></div>
+        </div>
+        <div class="field">
+          <span class="label">3D-режим</span>
+          <div class="chips" id="segStereo"></div>
+        </div>
+        <div class="field">
+          <span class="label">Качество</span>
+          <div class="chips" id="segQuality"></div>
+        </div>
+        <div class="field">
+          <span class="label">Глаза</span>
+          <label class="switch"><input type="checkbox" id="cSwap"><span></span>Поменять</label>
+        </div>
+        <div class="field grow">
+          <span class="label">Зум <b id="cZoomVal">0%</b></span>
+          <input type="range" id="cZoom" min="-100" max="100" value="0">
+        </div>
+        <div class="field grow">
+          <span class="label">Громкость</span>
+          <input type="range" id="cVol" min="0" max="100" value="100">
+        </div>
+        <button id="cCenter" class="btn ghost small">Центрировать</button>
+      </div>
+
+      <div class="hint panel">
+        <b>Управление в VR</b>
+        <div class="keys">
+          <span><kbd>Правый стик ↔</kbd> зум</span>
+          <span><kbd>Правый стик ↕</kbd> наклон</span>
+          <span><kbd>Левый стик ↔</kbd> перемотка</span>
+          <span><kbd>Левый стик ↕</kbd> громкость</span>
+          <span><kbd>A</kbd> пауза</span>
+          <span><kbd>B</kbd> панель</span>
+          <span><kbd>X</kbd> настройки</span>
+          <span><kbd>Нажать левый стик</kbd> центр</span>
+          <span><kbd>Курок</kbd> кнопки / показать панель</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Настройки по умолчанию -->
+  <dialog id="dlgPrefs">
+    <form method="dialog">
+      <h2>Настройки</h2>
+      <p class="muted">Применяются к новым видео. Если в имени файла есть метка (_360, _TB, _2D…), она важнее.</p>
+      <div class="field"><span class="label">Проекция по умолчанию</span><div class="chips" id="prefProj"></div></div>
+      <div class="field"><span class="label">3D-режим по умолчанию</span><div class="chips" id="prefStereo"></div></div>
+      <div class="field"><span class="label">Зум по умолчанию <b id="prefZoomVal"></b></span><input type="range" id="prefZoom" min="-100" max="100"></div>
+      <div class="field"><span class="label">Качество рендера в VR</span><div class="chips" id="prefQuality"></div>
+        <small class="muted">8K — максимальная чёткость (больше нагрузка на шлем).</small></div>
+      <label class="switch"><input type="checkbox" id="prefSwap"><span></span>Поменять глаза местами</label>
+      <label class="switch"><input type="checkbox" id="prefAutoVR"><span></span>Сразу входить в VR при выборе видео</label>
+      <div class="row">
+        <button value="reset" class="btn ghost">Сбросить</button>
+        <button value="close" class="btn">Готово</button>
+      </div>
+    </form>
+  </dialog>
+
+</body>
+</html>
