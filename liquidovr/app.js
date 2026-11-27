@@ -1326,7 +1326,7 @@ function setPicture(k, v) {
 
 // ───────── WebXR Media Layers ─────────
 // Видео отдаётся компоновщику шлема напрямую (без перерисовки через WebGL): чётко и без нагрузки.
-let xrLayersOK = false, mediaBinding = null, mediaLayer = null, mediaLayerKey = '';
+let xrLayersOK = false, mediaBinding = null, mediaLayer = null, mediaLayerKey = '', layerRetries = 0;
 let flatEye = { w: SCREEN_W, h: SCREEN_W * 9 / 16 };
 const BG_COLOR = new THREE.Color(0x050403);
 
@@ -1413,8 +1413,11 @@ function updateMediaLayer() {
     } catch (e) {
       console.warn('XR media layer:', e);
       mediaLayer = null;
-      xrLayersOK = false;
-      ui?.toastMsg('XR-слой недоступен — включён совместимый режим', true);
+      // Раньше одна неудача навсегда выключала XR-слой до конца сеанса → всё шло через WebGL (а он на 8K мигает).
+      // Теперь пробуем снова через 1,5 с (до 6 раз за видео).
+      layerRetries = (layerRetries || 0) + 1;
+      if (layerRetries <= 6) setTimeout(() => updateMediaLayer(), 1500);
+      else ui?.toastMsg('XR-слой недоступен — включён совместимый режим', true);
     }
   }
   if (base) { try { session.updateRenderState({ layers: [base] }); } catch { /* базовый XRWebGLLayer */ } }
@@ -2511,6 +2514,7 @@ function startVideo(src, resumeAt) {
   initScene();
   stageMsg('Загрузка потока…');
   video.volume = prefs.volume;
+  layerRetries = 0;
   video.src = src;
   video.defaultPlaybackRate = prefs.speed || 1;
   video.playbackRate = prefs.speed || 1;
@@ -2694,7 +2698,8 @@ function enterVR() {
   // В чётком режиме (XR-слой) видео выводит сам шлем, а WebGL рисует только интерфейс.
   // Огромный буфер ×1.5 при этом только нагружает GPU: пропуски кадров → рывки и «двоение» (репроекция).
   const q = QUALITY[prefs.quality].scale;
-  renderer.xr.setFramebufferScaleFactor(prefs.layers !== false ? Math.min(q, 1.2) : q);
+  // меньше нагрузка на GPU шлема: пропущенные кадры дают мигание. Видео в XR-слое от этого не теряет чёткость.
+  renderer.xr.setFramebufferScaleFactor(prefs.layers !== false ? 1.0 : Math.min(q, 1.2));
   // requestSession вызывается синхронно внутри жеста пользователя
   return navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'layers'] })
     .then(async (session) => {
