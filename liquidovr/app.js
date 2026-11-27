@@ -296,9 +296,22 @@ async function probeFormat(f) {
   }
   return meta || {};
 }
+// Плоские видео (16:9, 4:3, 32:9) по пропорциям кадра — чтобы обычные фильмы не попадали в купол 180°
+function aspectGuess(f) {
+  const vm = f.videoMediaMetadata;
+  if (!vm?.width || !vm?.height) return null;
+  const r = vm.width / vm.height;
+  if (r > 3.3 && r < 3.8) return { projection: 'flat', stereo: 'sbs' };   // Full-SBS 3D-фильм 32:9
+  if ((r > 1.25 && r < 1.45) || (r > 1.6 && r < 1.9) || (r > 2.25 && r < 2.5)) return { projection: 'flat', stereo: 'mono' };
+  if (r > 0.95 && r < 1.05) return { stereo: 'tb' };                       // 1:1 — VR Top-Bottom
+  return null;                                                              // 2:1 — VR180 SBS / 360 → по умолчанию
+}
+
 function fileFormat(f) {
   const saved = LS.get('liquido.fmt.' + f.id, null);
-  return { ...detectFormat(f.name), zoom: prefs.zoom, height: 0, ...(saved || {}) };
+  const det = detectFormat(f.name);
+  const guess = !saved && !det.marked ? aspectGuess(f) : null;
+  return { ...det, ...(guess || {}), guessed: !!guess, view: '3d', zoom: prefs.zoom, height: 0, ...(saved || {}) };
 }
 function formatLabel(fmt) {
   if (fmt.projection === 'flat') return fmt.stereo === 'mono' ? '2D' : '3D ' + (fmt.stereo === 'sbs' ? 'SBS' : 'TB');
@@ -566,15 +579,17 @@ const FLAT_NEAR = 1.3;  // при зуме +100 %
 const zoomAngle = () => 1;
 const zoomOffset = (z) => {
   if (z >= 0) return z * 0.55 * R;                                     // приближение: сфера ближе
-  return z * (state.projection === '360' ? 0.85 : 3.2) * R;            // отдаление: купол уезжает вперёд
+  return z * (effProj() === '360' ? 0.85 : 3.2) * R;                   // отдаление: купол уезжает вперёд
 };
-const domeAway = () => state.projection !== 'flat' && state.zoom < -0.001;
+const domeAway = () => effProj() !== 'flat' && state.zoom < -0.001;
 const flatDist = (z) => (z < 0 ? THREE.MathUtils.lerp(FLAT_BASE, FLAT_FAR, -z) : THREE.MathUtils.lerp(FLAT_BASE, FLAT_NEAR, z));
 const fmtZoom = (z) => (z > 0.005 ? '+' : z < -0.005 ? '−' : '') + Math.round(Math.abs(z) * 100) + '%';
 let baseYaw = 0, basePitch = 0, tilt = 0; // ориентация видео в VR (центр + наклон стиком)
 let baseDirs = null, lastAngle = -1;     // исходные направления вершин сферы (для зума в WebGL)
 
-const state = { projection: prefs.projection, stereo: prefs.stereo, swap: prefs.swap, zoom: prefs.zoom, height: 0 };
+const state = { projection: prefs.projection, stereo: prefs.stereo, swap: prefs.swap, zoom: prefs.zoom, height: 0, view: '3d' };
+// Режим как в популярных плеерах: «3D» — VR (купол/сфера/3D-экран), «2D» — обычный плоский экран, один глаз
+const effProj = () => (state.view === '2d' ? 'flat' : state.projection);
 let renderer, scene, camera, world, mediaGroup, videoTex, ui;
 const controllers = [];
 let current = null;
@@ -610,6 +625,7 @@ function buildEnvironment() {
   floor.renderOrder = -1;
   floor.name = 'floor';
   env.add(floor);
+  if (false) {  // тонкое кольцо пола рябило при поворотах головы — убрано
   const ring = new THREE.Mesh(new THREE.RingGeometry(2.96, 3.0, 128),
     new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0.35, depthWrite: false }));
   ring.rotation.x = -Math.PI / 2;
@@ -617,6 +633,8 @@ function buildEnvironment() {
   ring.name = 'ring';
   env.add(ring);
   // звёзды
+  }
+  if (false) {  // звёзды-точки мерцали при поворотах головы — убраны
   const pts = [];
   for (let i = 0; i < 900; i++) {
     const v = new THREE.Vector3().randomDirection().multiplyScalar(55);
@@ -626,6 +644,7 @@ function buildEnvironment() {
     new THREE.PointsMaterial({ color: 0x9fb8ff, size: 0.12, transparent: true, opacity: 0.7, depthWrite: false }));
   stars.name = 'stars';
   env.add(stars);
+  }
   return env;
 }
 
@@ -759,13 +778,15 @@ function rebuildMedia() {
   if (!renderer) return;
   disposeMedia();
   const vw = video.videoWidth || 1920, vh = video.videoHeight || 1080;
-  const { projection, stereo, swap } = state;
+  const { stereo, swap } = state;
+  const projection = effProj();
+  const vrSource = state.projection !== 'flat';   // 2D-режим для VR-видео: глаз квадратный, без «half-SBS»
   const seg = QUALITY[prefs.quality]?.seg || 96;
   let base;
   if (projection === 'flat') {
     let eyeAspect = vw / vh;
-    if (stereo === 'sbs') { eyeAspect /= 2; if (eyeAspect < 1.2) eyeAspect *= 2; }  // half-SBS
-    if (stereo === 'tb') { eyeAspect *= 2; if (eyeAspect > 2.6) eyeAspect /= 2; }   // half-TB
+    if (stereo === 'sbs') { eyeAspect /= 2; if (eyeAspect < 1.2 && !vrSource) eyeAspect *= 2; }  // half-SBS
+    if (stereo === 'tb') { eyeAspect *= 2; if (eyeAspect > 2.6 && !vrSource) eyeAspect /= 2; }   // half-TB
     flatEye = { w: SCREEN_W, h: SCREEN_W / eyeAspect };
     base = new THREE.PlaneGeometry(SCREEN_W, SCREEN_W / eyeAspect);
   } else if (projection === '360') {
@@ -794,6 +815,9 @@ function rebuildMedia() {
   };
   if (stereo === 'mono') {
     mediaGroup.add(new THREE.Mesh(base, mat()));
+  } else if (state.view === '2d') {
+    eyeUV(base, stereo, swap ? 1 : 0);          // 2D: оба глаза видят один и тот же кадр (левый глаз)
+    mediaGroup.add(new THREE.Mesh(base, mat()));
   } else {
     for (const eye of [0, 1]) {
       const g = base.clone();
@@ -805,7 +829,8 @@ function rebuildMedia() {
     base.dispose();
   }
   // пол виртуального зала — только для режима «Экран» (в 180/360 он оказался бы поверх видео)
-  for (const n of ['floor', 'ring']) { const o = scene.getObjectByName(n); if (o) o.visible = projection === 'flat'; }
+  for (const n of ['floor']) { const o = scene.getObjectByName(n); if (o) o.visible = projection === 'flat'; }
+  updateMipmaps();
   applyZoom();
   updateMediaLayer();
   ui?.redraw();
@@ -839,7 +864,8 @@ const BG_COLOR = new THREE.Color(0x030407);
 
 function layerWanted() {
   return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
-    state.projection !== 'fisheye' && !state.swap && !pictureActive() && !domeAway();
+    effProj() !== 'fisheye' && !state.swap && !pictureActive() && !domeAway() &&
+    !(state.view === '2d' && state.stereo !== 'mono');
 }
 
 function setSceneForLayer(on) {
@@ -850,9 +876,10 @@ function setSceneForLayer(on) {
   renderer.setClearColor(0x000000, on ? 0 : 1);
 }
 
-function layerTransform(dist) {
+function layerTransform(dist, follow) {
   world.updateMatrixWorld(true);
-  const pt = new THREE.Vector3(0, state.height, -dist).applyMatrix4(world.matrixWorld);
+  const base = follow ? headLocal : ZERO3;
+  const pt = new THREE.Vector3(base.x, base.y + state.height, base.z - dist).applyMatrix4(world.matrixWorld);
   const q = world.getWorldQuaternion(new THREE.Quaternion());
   return new XRRigidTransform({ x: pt.x, y: pt.y, z: pt.z }, { x: q.x, y: q.y, z: q.z, w: q.w });
 }
@@ -861,11 +888,13 @@ function applyLayerProps() {
   if (!mediaLayer) return;
   const z = state.zoom;
   try {
-    if (state.projection === 'flat') {
+    if (effProj() === 'flat') {
       mediaLayer.transform = layerTransform(flatDist(z));
     } else {
       const a = zoomAngle(z); // слой растягивает весь кадр на заданный угол → меньше угол = меньше картинка
-      mediaLayer.transform = layerTransform(-zoomOffset(z));
+      const zoomed = z > 0.001;
+      mediaLayer.radius = zoomed ? R : 0;   // 0 = бесконечная сфера: при движении головы картинка не «плывёт»
+      mediaLayer.transform = layerTransform(-zoomOffset(z), zoomed);
       mediaLayer.centralHorizontalAngle = (state.projection === '360' ? 2 * Math.PI : Math.PI) * a;
       mediaLayer.upperVerticalAngle = (Math.PI / 2) * a;
       mediaLayer.lowerVerticalAngle = (-Math.PI / 2) * a;
@@ -878,7 +907,7 @@ function updateMediaLayer() {
   const session = renderer.xr.getSession();
   const base = renderer.xr.getBaseLayer();
   const want = layerWanted();
-  const key = want ? [state.projection, state.stereo, video.currentSrc, flatEye.w.toFixed(3), flatEye.h.toFixed(3)].join('|') : '';
+  const key = want ? [effProj(), state.stereo, video.currentSrc, flatEye.w.toFixed(3), flatEye.h.toFixed(3)].join('|') : '';
   if (want && key === mediaLayerKey && mediaLayer) { applyLayerProps(); return; }
   if (mediaLayer) { try { mediaLayer.destroy(); } catch { /* ignore */ } mediaLayer = null; }
   mediaLayerKey = '';
@@ -887,9 +916,9 @@ function updateMediaLayer() {
       mediaBinding = mediaBinding || new XRMediaBinding(session);
       const layout = state.stereo === 'sbs' ? 'stereo-left-right' : state.stereo === 'tb' ? 'stereo-top-bottom' : 'mono';
       const space = renderer.xr.getReferenceSpace();
-      mediaLayer = state.projection === 'flat'
+      mediaLayer = effProj() === 'flat'
         ? mediaBinding.createQuadLayer(video, { space, layout, width: flatEye.w, height: flatEye.h })
-        : mediaBinding.createEquirectLayer(video, { space, layout, radius: R });
+        : mediaBinding.createEquirectLayer(video, { space, layout, radius: state.zoom > 0.001 ? R : 0 });
       mediaLayerKey = key;
       applyLayerProps();
       session.updateRenderState({ layers: [mediaLayer, base] });
@@ -925,11 +954,42 @@ function applyAngular(a) {
   }
 }
 
+// ───────── сфера «следует» за головой (только перенос), как во всех VR-плеерах ─────────
+const ZERO3 = new THREE.Vector3();
+const headLocal = new THREE.Vector3();
+const _hp = new THREE.Vector3(), _hq = new THREE.Quaternion(), _hs = new THREE.Vector3();
+function followHead() {
+  const cams = renderer.xr.getCamera().cameras;   // позы глаз текущего кадра
+  if (!cams || !cams.length) return;
+  headLocal.set(0, 0, 0);
+  for (const c of cams) { c.matrix.decompose(_hp, _hq, _hs); headLocal.add(_hp); }
+  headLocal.multiplyScalar(1 / cams.length);
+  world.worldToLocal(headLocal);
+  if (effProj() !== 'flat' && !domeAway()) {
+    mediaGroup.position.set(headLocal.x, headLocal.y + state.height, headLocal.z + zoomOffset(state.zoom));
+    if (mediaLayer && state.zoom > 0.001) applyLayerProps();
+  }
+}
+
+// Мип-карты нужны, когда видео заметно уменьшено (далёкий экран, отъехавший купол) — иначе рябь
+let mipOn = null;
+function updateMipmaps() {
+  if (!videoTex) return;
+  const on = !mediaLayer && (domeAway() || (effProj() === 'flat' && flatDist(state.zoom) > 3));
+  if (on === mipOn) return;
+  mipOn = on;
+  videoTex.generateMipmaps = on;
+  videoTex.minFilter = on ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  videoTex.anisotropy = on ? (renderer.capabilities.getMaxAnisotropy() || 1) : 1;
+  videoTex.needsUpdate = true;
+}
+
 function applyZoom() {
   if (!mediaGroup) return;
   const z = state.zoom;
-  if (state.projection === 'flat') mediaGroup.position.set(0, state.height, -flatDist(z));
-  else { mediaGroup.position.set(0, state.height, zoomOffset(z)); applyAngular(zoomAngle(z)); }
+  if (effProj() === 'flat') mediaGroup.position.set(0, state.height, -flatDist(z));
+  else { mediaGroup.position.set(headLocal.x, headLocal.y + state.height, headLocal.z + zoomOffset(z)); applyAngular(zoomAngle(z)); }
+  updateMipmaps();
   if (renderer?.xr?.isPresenting && layerWanted() !== !!mediaLayer) updateMediaLayer();
   else applyLayerProps();
 }
@@ -953,7 +1013,7 @@ function applyWorldRotation() {
 
 function saveFormat() {
   if (current && !String(current.id).startsWith('demo:')) {
-    LS.set('liquido.fmt.' + current.id, { projection: state.projection, stereo: state.stereo, swap: state.swap, zoom: state.zoom, height: state.height });
+    LS.set('liquido.fmt.' + current.id, { projection: state.projection, stereo: state.stereo, swap: state.swap, zoom: state.zoom, height: state.height, view: state.view });
   }
 }
 function setFormat(patch) {
@@ -1233,12 +1293,13 @@ function drawMain(p) {
   iconButton(p, 'next', cx + 340, cy, 48, 'next', () => playSibling(1));
 
   // слева: текущий формат (открывает настройки)
-  const chip = `${PROJ_NAME[state.projection]} · ${STEREO_NAME[state.stereo]} · ${mediaLayer ? 'XR' : QUALITY[prefs.quality].name}`;
-  textButton(p, 'fmt', 60, cy - 46, 410, 92, chip, () => ui.openSettings(true));
+  const chip = `${PROJ_NAME[state.projection]} · ${state.stereo === 'mono' ? '2D' : state.stereo.toUpperCase()}`;
+  textButton(p, 'view', 60, cy - 46, 150, 92, state.view === '2d' ? '2D' : '3D', () => setFormat({ view: state.view === '2d' ? '3d' : '2d' }), true);
+  textButton(p, 'fmt', 226, cy - 46, 280, 92, chip, () => ui.openSettings(true));
   c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `600 24px ${FONT}`;
   const res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : '—';
   const sp = (prefs.speed || 1) !== 1 ? `  ·  ${prefs.speed}×` : '';
-  c.fillText(`${res}  ·  Зум ${fmtZoom(state.zoom)}${sp}`, 72, cy + 80);
+  c.fillText(`${res}  ·  ${mediaLayer ? 'XR-слой' : QUALITY[prefs.quality].name}  ·  Зум ${fmtZoom(state.zoom)}${sp}`, 72, cy + 80);
 
   // справа: библиотека, настройки, центр, выход
   iconButton(p, 'library', W - 460, cy, 54, 'grid', () => ui.openLibrary(), { active: ui.sheet === 'library' });
@@ -1296,16 +1357,13 @@ function drawSettings(p) {
     valueSlider(p, 'height', CX, y, CW, RH, (state.height + 1.5) / 3, signed(state.height * 100) + ' см',
       (v) => { setHeight(v * 3 - 1.5); saveFormat(); }, 0.1 / 3);
     y += STEP;
+    label('Режим');
+    segmented(p, 'view', CX, y, CW, RH, [['3d', '3D (VR)'], ['2d', '2D (обычный экран)']], state.view, (k) => setFormat({ view: k }));
+    y += STEP;
     label('Угол fisheye');
     segmented(p, 'fov', CX, y, CW, RH, [[180, '180°'], [190, '190°'], [200, '200°'], [220, '220°']], prefs.fisheyeFov || 180, (k) => {
       prefs.fisheyeFov = k; savePrefs(); rebuildMedia();
       if (state.projection !== 'fisheye') ui.toastMsg('Применяется к видео в проекции Fisheye');
-    });
-    y += STEP;
-    label('Вывод видео');
-    segmented(p, 'out', CX, y, CW, RH, [['layer', 'Чёткий (XR-слой)'], ['gl', 'Совместимый']], prefs.layers !== false ? 'layer' : 'gl', (k) => {
-      prefs.layers = k === 'layer'; savePrefs(); updateMediaLayer();
-      ui.toastMsg(prefs.layers ? (mediaLayer ? 'Чёткий режим включён' : 'XR-слой недоступен для этого формата/настроек') : 'Совместимый режим');
     });
     y += STEP + 10;
     textButton(p, 'savedef', 64, y, 820, 92, 'Сделать форматом по умолчанию', () => {
@@ -1314,7 +1372,7 @@ function drawSettings(p) {
       ui.toastMsg('Сохранено как формат по умолчанию');
     }, true);
     textButton(p, 'reset', 908, y, W - 908 - 64, 92, 'Сброс: 180° SBS', () => {
-      setFormat({ projection: '180', stereo: 'sbs', swap: false });
+      setFormat({ projection: '180', stereo: 'sbs', swap: false, view: '3d' });
       state.height = 0; setZoom(0); tilt = 0; if (renderer?.xr?.isPresenting) applyWorldRotation(); saveFormat();
     });
   } else if (ui.tab === 'picture') {
@@ -1346,6 +1404,12 @@ function drawSettings(p) {
     segmented(p, 'q', CX, y, CW, RH, QUALITY_KEYS.map((k) => [k, QUALITY[k].name]), prefs.quality, (k) => {
       prefs.quality = k; savePrefs(); rebuildMedia(); syncPrefsUI();
       ui.toastMsg('Чёткость рендера изменится при следующем входе в VR');
+    });
+    y += STEP;
+    label('Вывод видео');
+    segmented(p, 'out', CX, y, CW, RH, [['layer', 'Чёткий (XR-слой)'], ['gl', 'Совместимый']], prefs.layers !== false ? 'layer' : 'gl', (k) => {
+      prefs.layers = k === 'layer'; savePrefs(); updateMediaLayer();
+      ui.toastMsg(prefs.layers ? (mediaLayer ? 'Чёткий режим включён' : 'XR-слой недоступен для этого формата/настроек') : 'Совместимый режим');
     });
     y += STEP;
     label('Следующее видео');
@@ -1589,6 +1653,9 @@ class VRUI {
 
 // ───────────────────────── ввод: лучи, курок, стики ─────────────────────────
 const raycaster = new THREE.Raycaster();
+let lastInput = 0;            // время последнего нажатия/движения стиков
+const RAY_TIMEOUT = 15000;
+const raysOn = () => ui.visible && now() - lastInput < RAY_TIMEOUT;
 const tmpM = new THREE.Matrix4();
 
 function pulse(c, intensity = 0.25, ms = 18) {
@@ -1597,7 +1664,10 @@ function pulse(c, intensity = 0.25, ms = 18) {
 
 function onSelectStart(c) {
   const h = c.userData.hit;
+  const wasOn = raysOn();
+  lastInput = now();
   ui.lastActivity = now();
+  if (!wasOn) { ui.setVisible(true); return; }   // первый курок только показывает панель и лучи
   if (ui.visible && h) {
     if (h.region) {
       h.region.onPress(h.fx);
@@ -1617,7 +1687,9 @@ function updatePointers() {
     const ud = c.userData;
     ud.hit = null;
     let len = 4;
-    if (c.visible && ui.visible) {
+    const on = raysOn();
+    ud.ray.visible = on;
+    if (c.visible && on) {
       tmpM.identity().extractRotation(c.matrixWorld);
       raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
       raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpM);
@@ -1663,15 +1735,13 @@ function handleGamepads(dt) {
       // правый стик влево/вправо — зум
       if (Math.abs(ax) > 0.15 && Math.abs(ax) >= Math.abs(ay)) {
         setZoom(state.zoom + ax * dt * 0.8);      // вправо — приблизить, влево — отдалить
-        ui.toastMsg('Зум ' + fmtZoom(state.zoom));
       } else if (Math.abs(ay) > 0.2) {
         tilt = clamp(tilt + ay * dt * 0.9, -1.3, 1.3); // вверх/вниз — наклон камеры
         applyWorldRotation();
-        ui.toastMsg('Наклон ' + Math.round(-tilt * 180 / Math.PI) + '°');
       }
       if (pressed(4)) togglePlay();                       // A
       if (pressed(5)) ui.toggle();                        // B
-      if (pressed(3)) { setZoom(prefs.zoom); tilt = 0; applyWorldRotation(); ui.toastMsg('Зум и наклон сброшены'); } // нажатие правого стика
+      if (pressed(3)) { setZoom(prefs.zoom); tilt = 0; applyWorldRotation(); } // нажатие правого стика
       if (prev[0] === undefined) { /* first frame */ }
     } else if (hand === 'left') {
       // левый стик: ↔ перемотка, ↕ громкость
@@ -1689,9 +1759,10 @@ function handleGamepads(dt) {
       }
       if (pressed(4)) ui.openSettings();                  // X — настройки
       if (pressed(5)) togglePlay();                       // Y
-      if (pressed(3)) { recenter(); ui.toastMsg('Центрировано'); } // нажатие левого стика
+      if (pressed(3)) recenter(); // нажатие левого стика
     }
-    if (gp.buttons.some((b, i) => b.pressed && !prev[i])) ui.lastActivity = now();
+    if (gp.buttons.some((b, i) => b.pressed && !prev[i])) { ui.lastActivity = now(); lastInput = now(); }
+    if (Math.abs(ax) > 0.3 || Math.abs(ay) > 0.3) lastInput = now();
     prevButtons[hand] = gp.buttons.map((b) => b.pressed);
   }
 }
@@ -1702,6 +1773,7 @@ function renderFrame() {
   if (renderer.xr.isPresenting) {
     if (recenterFrames > 0 && --recenterFrames === 0) recenter();
     handleGamepads(dt);
+    followHead();
     const hovering = updatePointers();
     ui.tick(now(), hovering);
   } else {
@@ -1717,14 +1789,14 @@ async function playFile(f) {
   await sendAuthToSW();
   current = f;
   const fmt = fileFormat(f);
-  if (!LS.get('liquido.fmt.' + f.id, null) && !fmt.marked) {
+  if (!LS.get('liquido.fmt.' + f.id, null) && !fmt.marked && !fmt.guessed) {
     stageMsg('Определяю формат видео…');
     ui?.toastMsg('Определяю формат видео…');
     const meta = await probeFormat(f);
     if (meta.projection) fmt.projection = meta.projection;
     if (meta.stereo) fmt.stereo = meta.stereo;
   }
-  Object.assign(state, { projection: fmt.projection, stereo: fmt.stereo, swap: fmt.swap, zoom: fmt.zoom ?? prefs.zoom, height: fmt.height || 0 });
+  Object.assign(state, { projection: fmt.projection, stereo: fmt.stereo, swap: fmt.swap, zoom: fmt.zoom ?? prefs.zoom, height: fmt.height || 0, view: fmt.view || '3d' });
   showPlayer();
   $('#nowTitle').textContent = f.name;
   currentSrc = 'stream/' + encodeURIComponent(f.id) + '?size=' + (f.size || 0) + '&mime=' + encodeURIComponent(guessMime(f));
@@ -1761,6 +1833,7 @@ video.addEventListener('loadedmetadata', () => {
   videoTex.minFilter = THREE.LinearFilter;
   videoTex.magFilter = THREE.LinearFilter;
   videoTex.generateMipmaps = false;
+  mipOn = null;
   rebuildMedia();
   const r = Number(video.dataset.resume) || 0;
   if (r > 0 && r < video.duration - 5) {
