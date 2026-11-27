@@ -38,6 +38,10 @@ const ICONS = {
   film: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/></svg>',
   play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15l13-7.5Z"/></svg>',
+  full: '<svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+  unfull: '<svg viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>',
+  sound: '<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4Z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg>',
+  muted: '<svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4Z"/><path d="m17 9 5 6M22 9l-5 6"/></svg>',
   pause: '<svg viewBox="0 0 24 24"><rect x="6" y="4.5" width="4" height="15" rx="1"/><rect x="14" y="4.5" width="4" height="15" rx="1"/></svg>',
 };
 
@@ -1208,16 +1212,41 @@ function updateNativeMode() {
   $('#btnVR').hidden = on && !xrSupported;
   if (!on && document.fullscreenElement === video) document.exitFullscreen().catch(() => {});
 }
+// На весь экран разворачиваем весь #stage: видео + наша панель управления (не стандартные кнопки браузера).
 function toggleFullscreen() {
   if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
-  const el = nativeOn ? video : $('#stage');
-  el.requestFullscreen?.().catch((e) => stageMsg('Не удалось открыть на весь экран: ' + e.message));
+  $('#stage').requestFullscreen?.().catch((e) => stageMsg('Не удалось открыть на весь экран: ' + e.message));
+}
+let idleTimer = 0;
+function wakeControls() {
+  const st = $('#stage');
+  st.classList.remove('idle');
+  clearTimeout(idleTimer);
+  if (document.fullscreenElement === st) idleTimer = setTimeout(() => { if (!video.paused) st.classList.add('idle'); }, 2500);
 }
 document.addEventListener('fullscreenchange', () => {
-  video.controls = document.fullscreenElement === video;   // во весь экран — стандартные кнопки браузера
+  const st = $('#stage'), tr = $('.transport'), fs = document.fullscreenElement === st;
+  if (fs) st.append(tr); else if (tr.parentElement === st) st.after(tr);   // панель переезжает внутрь полноэкранного плеера
+  $('#fsTitle').textContent = $('#nowTitle').textContent;
+  $('#fsFmt').textContent = $('#nowFmt').textContent;
+  syncFullBtn();
+  wakeControls();
   onResize();
 });
-video.addEventListener('click', () => { if (nativeOn && !video.controls) togglePlay(); });
+function syncFullBtn() {
+  const fs = !!document.fullscreenElement;
+  $('#cFull').innerHTML = fs ? ICONS.unfull : ICONS.full;
+  $('#cFull').title = fs ? 'Выйти из полноэкранного режима (F, Esc)' : 'На весь экран (F)';
+}
+function syncMute() {
+  $('#cMute').innerHTML = video.muted || video.volume === 0 ? ICONS.muted : ICONS.sound;
+  $('#cVolT').value = video.muted ? 0 : Math.round(video.volume * 100);
+  paintRange($('#cVolT'));
+}
+video.addEventListener('volumechange', syncMute);
+video.addEventListener('pause', wakeControls);
+video.addEventListener('play', wakeControls);
+video.addEventListener('click', () => { if (nativeOn) togglePlay(); });
 video.addEventListener('dblclick', (e) => { if (nativeOn) { e.preventDefault(); toggleFullscreen(); } });
 
 // ───────── регулировка картинки ─────────
@@ -1542,6 +1571,7 @@ function setVolume(v) {
   savePrefs();
   $('#cVol').value = Math.round(video.volume * 100);
   paintRange($('#cVol'));
+  syncMute();
 }
 
 // ───────────────────────── VR-интерфейс (рисуется на canvas) ─────────────────────────
@@ -2707,6 +2737,11 @@ function bindUI() {
   $('#btnMore').onclick = () => loadList(false);
   $('#btnBack').onclick = showBrowser;
   $('#btnFull').onclick = toggleFullscreen;
+  $('#cFull').onclick = toggleFullscreen;
+  $('#cMute').onclick = () => { video.muted = !video.muted; if (!video.muted && video.volume === 0) setVolume(0.5); };
+  $('#cVolT').oninput = (e) => { video.muted = false; setVolume(e.target.value / 100); };
+  $('#stage').addEventListener('mousemove', wakeControls);
+  syncFullBtn(); syncMute();
   $('#btnVR').onclick = () => { if (renderer?.xr?.isPresenting) renderer.xr.getSession().end(); else enterVR(); };
   $('#cPlay').onclick = togglePlay;
   $('#cBack').onclick = () => seekBy(-seekStep());

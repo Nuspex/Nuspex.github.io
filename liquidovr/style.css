@@ -288,6 +288,21 @@ body.native-video #video {
 }
 body.native-video #stage canvas { visibility: hidden; }
 #stageMsg, .vr-cta { z-index: 2; }
-#video:fullscreen { object-fit: contain; background: #000; cursor: auto; }
-#stage:fullscreen { max-height: none; border: 0; border-radius: 0; aspect-ratio: auto; }
+/* ── на весь экран: наш плеер целиком (видео + наша панель), а не стандартный интерфейс браузера ── */
+.transport .vol { width: 110px; flex: none; }
+.fs-top { display: none; }
+#stage:fullscreen { width: 100vw; height: 100vh; max-height: none; aspect-ratio: auto; border: 0; border-radius: 0; box-shadow: none; }
+#stage:fullscreen .vr-cta { display: none; }
+#stage:fullscreen .fs-top {
+  display: block; position: absolute; z-index: 3; left: 0; right: 0; top: 0; padding: 26px 40px 70px;
+  background: linear-gradient(rgba(15, 13, 11, .88), transparent); pointer-events: none; transition: opacity .3s;
+}
+#stage:fullscreen #fsTitle { margin-top: 8px; font: 700 28px/1.2 var(--font-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#stage:fullscreen .transport {
+  position: absolute; z-index: 3; left: 0; right: 0; bottom: 0; margin: 0; padding: 70px 40px 28px;
+  border: 0; border-radius: 0; background: linear-gradient(transparent, rgba(15, 13, 11, .92) 55%); transition: opacity .3s;
+}
+#stage:fullscreen #stageMsg { bottom: 110px; background: none; text-align: center; }
+#stage.idle { cursor: none; }
+#stage.idle .transport, #stage.idle .fs-top { opacity: 0; pointer-events: none; }
 #btnFull svg { width: 16px; height: 16px; }

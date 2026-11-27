@@ -84,6 +84,7 @@
 
       <div id="stage">
         <video id="video" playsinline preload="auto"></video>
+        <div class="fs-top"><span id="fsFmt" class="eyebrow"></span><div id="fsTitle"></div></div>
         <div id="stageMsg"></div>
         <button id="btnVR" class="vr-cta">
           <svg viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4l-2-3h-2l-2 3H5a2 2 0 0 1-2-2Z"/><circle cx="8" cy="11.5" r="1.6"/><circle cx="16" cy="11.5" r="1.6"/></svg>
@@ -102,6 +103,9 @@
         <span id="cTimeCur" class="time">0:00</span>
         <input type="range" id="cSeek" min="0" max="1000" value="0" aria-label="Позиция">
         <span id="cTime" class="time">0:00</span>
+        <button id="cMute" class="icon-btn" title="Звук (M)" aria-label="Звук"></button>
+        <input type="range" id="cVolT" class="vol" min="0" max="100" value="100" aria-label="Громкость">
+        <button id="cFull" class="icon-btn" title="На весь экран (F)" aria-label="На весь экран"></button>
       </div>
 
       <div class="formats panel">
