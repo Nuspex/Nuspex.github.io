@@ -763,6 +763,28 @@ function fisheyeUV(geo, fovDeg = 180) {
   uv.needsUpdate = true;
 }
 
+// Плоский экран → направление взгляда → координаты кадра VR-видео (равнопромежуточная/fisheye развёртка)
+function rectilinearUV(geo, proj, w, hfovDeg) {
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  const t = Math.tan(THREE.MathUtils.degToRad(hfovDeg) / 2);
+  const half = THREE.MathUtils.degToRad(prefs.fisheyeFov || 180) / 2;
+  const d = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    d.set(pos.getX(i) / (w / 2) * t, pos.getY(i) / (w / 2) * t, -1).normalize();
+    let u, v;
+    if (proj === 'fisheye') {
+      const th = Math.acos(clamp(-d.z, -1, 1)), a = Math.atan2(d.y, d.x), r = (th / half) * 0.5;
+      u = 0.5 + r * Math.cos(a); v = 0.5 + r * Math.sin(a);
+    } else {
+      const lon = Math.atan2(d.x, -d.z), lat = Math.asin(clamp(d.y, -1, 1));
+      u = 0.5 + lon / (proj === '360' ? 2 * Math.PI : Math.PI);
+      v = 0.5 + lat / Math.PI;
+    }
+    uv.setXY(i, u, v);
+  }
+  uv.needsUpdate = true;
+}
+
 function eyeUV(geo, layout, eye) { // eye: 0 — левый, 1 — правый
   const uv = geo.attributes.uv;
   for (let i = 0; i < uv.count; i++) {
@@ -783,7 +805,13 @@ function rebuildMedia() {
   const vrSource = state.projection !== 'flat';   // 2D-режим для VR-видео: глаз квадратный, без «half-SBS»
   const seg = QUALITY[prefs.quality]?.seg || 96;
   let base;
-  if (projection === 'flat') {
+  if (state.view === '2d' && vrSource) {
+    // 2D для VR-видео: плоский экран 16:9 с «виртуальной камерой» в центр сцены — нормальная перспектива
+    const H = SCREEN_W * 9 / 16;
+    flatEye = { w: SCREEN_W, h: H };
+    base = new THREE.PlaneGeometry(SCREEN_W, H, 96, 54);
+    rectilinearUV(base, state.projection, SCREEN_W, 95);
+  } else if (projection === 'flat') {
     let eyeAspect = vw / vh;
     if (stereo === 'sbs') { eyeAspect /= 2; if (eyeAspect < 1.2 && !vrSource) eyeAspect *= 2; }  // half-SBS
     if (stereo === 'tb') { eyeAspect *= 2; if (eyeAspect > 2.6 && !vrSource) eyeAspect /= 2; }   // half-TB
@@ -865,7 +893,7 @@ const BG_COLOR = new THREE.Color(0x030407);
 function layerWanted() {
   return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
     effProj() !== 'fisheye' && !state.swap && !pictureActive() && !domeAway() &&
-    !(state.view === '2d' && state.stereo !== 'mono');
+    !(state.view === '2d' && (state.stereo !== 'mono' || state.projection !== 'flat'));
 }
 
 function setSceneForLayer(on) {
