@@ -358,7 +358,7 @@ function formatLabel(fmt) {
 }
 // «180° · SBS · 8K» — для героя, плеера и VR-билета
 function formatLine(fmt, vm) {
-  const parts = [PROJ_NAME[fmt.projection], fmt.stereo === 'mono' ? '2D' : fmt.stereo.toUpperCase()];
+  const parts = [PROJ_NAME[fmt.projection], fmt.stereo === 'mono' ? '2D' : fmt.stereo.toUpperCase() + (fmt.view === 'mono' ? ' · MONO' : '')];
   const w = vm?.width || 0;
   if (w) parts.push(w >= 7000 ? '8K' : w >= 5000 ? '6K' : w >= 3800 ? '4K' : w >= 2500 ? '2.7K' : w >= 1900 ? 'HD' : w + 'p');
   return parts.join(' · ');
@@ -1177,7 +1177,7 @@ void main() {`)
   };
   if (stereo === 'mono') {
     mediaGroup.add(new THREE.Mesh(base, mat()));
-  } else if (state.view === '2d') {
+  } else if (state.view === '2d' || state.view === 'mono') {   // mono: купол 180°, оба глаза — одна половина кадра
     eyeUV(base, stereo, swap ? 1 : 0);          // 2D: оба глаза видят один и тот же кадр (левый глаз)
     mediaGroup.add(new THREE.Mesh(base, mat(eyeRect(swap ? 1 : 0))));
   } else {
@@ -1333,7 +1333,8 @@ const BG_COLOR = new THREE.Color(0x050403);
 function layerWanted() {
   return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
     effProj() !== 'fisheye' && !state.swap && !needsGLPicture() &&
-    !(state.view === '2d' && (state.stereo !== 'mono' || state.projection !== 'flat'));
+    !(state.view === '2d' && (state.stereo !== 'mono' || state.projection !== 'flat')) &&
+    !(state.view === 'mono' && state.stereo !== 'mono');   // XR-слой не умеет показать обоим глазам одну половину
 }
 
 let layerOnScene = false;
@@ -1842,8 +1843,10 @@ function drawMain(p) {
 
   // 3) режим и формат, ниже — библиотека, настройки, центр, выход
   const RX = TICKET.P2 + 44;
-  textButton(p, 'view', RX, cy - 46, 136, 92, state.view === '2d' ? '2D' : '3D',
-    () => setFormat({ view: state.view === '2d' ? '3d' : '2d' }), state.view !== '2d');
+  // кнопка 3D/2D: у VR-видео (180°/360° SBS/TB) — 3D ↔ 2D Mono (купол остаётся), у обычных — 3D ↔ плоский экран
+  const vrStereo = state.projection !== 'flat' && state.stereo !== 'mono';
+  textButton(p, 'view', RX, cy - 46, 136, 92, state.view === '3d' ? '3D' : '2D',
+    () => setFormat({ view: state.view === '3d' ? (vrStereo ? 'mono' : '2d') : '3d' }), state.view === '3d');
   textButton(p, 'fmt', RX + 152, cy - 46, W - 56 - (RX + 152), 92,
     `${PROJ_NAME[state.projection]} · ${state.stereo === 'mono' ? '2D' : state.stereo.toUpperCase()}`, () => ui.openSettings(true));
   const by = 246, step = 128;
@@ -1903,7 +1906,7 @@ function drawSettings(p) {
       (v) => { setHeight(v * 3 - 1.5); saveFormat(); }, 0.1 / 3);
     y += STEP;
     label('Режим');
-    segmented(p, 'view', CX, y, CW, RH, [['3d', '3D (VR)'], ['2d', '2D (обычный экран)']], state.view, (k) => setFormat({ view: k }));
+    segmented(p, 'view', CX, y, CW, RH, [['3d', '3D'], ['mono', '2D Mono (180°)'], ['2d', '2D экран']], state.view, (k) => setFormat({ view: k }));
     y += STEP;
     label('Угол fisheye');
     segmented(p, 'fov', CX, y, CW, RH, [[180, '180°'], [190, '190°'], [200, '200°'], [220, '220°']], fisheyeFov(), (k) => {
