@@ -2554,7 +2554,7 @@ video.addEventListener('loadedmetadata', () => {
     ui?.toastMsg('Продолжаем с ' + fmtTime(r), false, 2500);
   } else stageMsg('');
   video.dataset.resume = 0;
-  prebufferThenPlay(8, 12000);         // накопить ~8 с видео перед стартом
+  prebufferThenPlay(15, 20000);        // накопить ~15 с видео перед стартом
   setTimeout(() => { if (!video.paused) stageMsg(''); }, 2500);
 });
 // «Загрузка…» в шлеме: без неё в VR видео просто замирает. Короткие паузы (<0,7 с) не показываем.
@@ -2579,7 +2579,7 @@ video.addEventListener('seeking', () => {
   if (!video.paused || pbActive) { seekWasPlaying = true; if (!video.paused) bufferingOn(); }
 });
 video.addEventListener('seeked', () => {
-  if (seekWasPlaying) { seekWasPlaying = false; prebufferThenPlay(4, 8000); }   // после перемотки — ~4 с запаса
+  if (seekWasPlaying) { seekWasPlaying = false; prebufferThenPlay(8, 12000); }   // после перемотки — ~8 с запаса
 });
 
 // ── Предзагрузка: перед стартом и после перемотки ждём, пока в буфере наберётся запас видео,
