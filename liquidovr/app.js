@@ -129,8 +129,52 @@ function showLoginHelp(configured) {
   'Проверить', async () => { if (await checkAccount()) openSource('root'); });
 }
 
+// Посредник приложения LiquidoVR (Quest, Wi-Fi): /__liquido/status. null — его нет (кабель или ПК напрямую).
+async function bridgeStatus() {
+  if (!PC_BASE) return null;
+  let r;
+  try { r = await fetch(PC_BASE + '__liquido/status', { cache: 'no-store' }); } catch { throw new Error('Нет связи с программой на ПК.'); }
+  if (r.status === 404 || r.status === 403) return null; // отвечает сам ПК (adb reverse)
+  return r.ok ? r.json() : null;
+}
+
+function showPairing(st, error) {
+  account = null;
+  updateAuthUI();
+  const where = st?.host ? 'Компьютер найден: ' + st.host + '. ' : 'Компьютер с LiquidoVR не найден в сети. ';
+  banner(where + 'Введите PIN из окна «Запустить.cmd» на ПК.', 'Ввести PIN', async () => {
+    const pin = prompt('PIN из окна «Запустить.cmd» на ПК:');
+    if (pin) pairWith(pin.trim(), '');
+  });
+  if (ui) {
+    ui.pair = { ...(ui.pair || {}), st, error: error || '', busy: false };
+    if (!st?.host && !ui.pair.mode) ui.pair.mode = 'pin';
+    ui.openSheet('pair', true);
+  }
+}
+
+async function pairWith(pin, host) {
+  if (ui?.pair) { ui.pair.busy = true; ui.pair.error = ''; ui.redraw(); }
+  let res;
+  try {
+    const q = 'pin=' + encodeURIComponent(pin) + (host ? '&host=' + encodeURIComponent(host) : '');
+    res = await fetch(PC_BASE + '__liquido/pair?' + q, { cache: 'no-store' }).then((r) => r.json());
+  } catch { res = { ok: false, error: 'Нет связи с приложением' }; }
+  if (res.ok) {
+    if (ui?.pair) ui.pair = { mode: 'pin', pin: '', ip: '' };
+    if (await checkAccount()) { openSource('root'); ui?.openLibrary(true); ui?.toastMsg('Шлем привязан к ПК'); }
+  } else {
+    let st = null;
+    try { st = await bridgeStatus(); } catch { /* ignore */ }
+    showPairing(st, res.error || 'Неверный PIN');
+  }
+}
+
 async function checkAccount() {
   try {
+    const st = await bridgeStatus();
+    if (st && !st.paired) { showPairing(st); return false; }
+    if (ui?.sheet === 'pair') ui.openSheet('pair', false);
     const s = await serverJSON('api/status');
     account = s.signedIn ? s : null;
     if (account) { banner(null); await getToken(); } else showLoginHelp(s.configured);
@@ -1392,6 +1436,56 @@ function drawLibrary(p) {
   p.end();
 }
 
+function drawPair(p) {
+  const c = p.ctx, W = p.W;
+  const st = ui.pair || {};
+  const mode = st.mode || 'pin';
+  p.begin();
+  sheetHeader(p, 'Подключение к ПК');
+  c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `600 32px ${FONT}`;
+  c.fillText(st.st?.host ? 'Компьютер найден: ' + st.st.host : 'Компьютер с LiquidoVR не найден в сети', 64, 170);
+  c.fillText(mode === 'pin' ? 'Введите PIN из окна «Запустить.cmd» на ПК' : 'Введите адрес ПК (показан в окне «Запустить.cmd»)', 64, 220);
+
+  // поле ввода
+  const val = mode === 'pin' ? (st.pin || '') : (st.ip || '');
+  rr(c, 64, 260, 700, 110, 24); c.fillStyle = 'rgba(255,255,255,0.06)'; c.fill();
+  c.strokeStyle = 'rgba(53,208,255,0.5)'; c.lineWidth = 3; c.stroke();
+  c.textAlign = 'center'; c.fillStyle = C.text; c.font = `800 60px ${FONT}`;
+  c.fillText(mode === 'pin' ? (val.padEnd(6, '·').split('').join(' ')) : (val || '192.168.…'), 64 + 350, 318);
+  if (st.error) { c.textAlign = 'left'; c.fillStyle = C.warn; c.font = `700 30px ${FONT}`; c.fillText(st.error, 64, 420); }
+  if (st.busy) { c.textAlign = 'left'; c.fillStyle = C.a1; c.font = `700 30px ${FONT}`; c.fillText('Подключаюсь…', 64, 420); }
+
+  // кнопки действий слева
+  const setVal = (v) => { if (mode === 'pin') st.pin = v; else st.ip = v; ui.redraw(); };
+  textButton(p, 'pairgo', 64, 480, 700, 100, mode === 'pin' ? 'Привязать шлем' : 'Подключиться по адресу', () => {
+    if (st.busy) return;
+    if (mode === 'pin') { if ((st.pin || '').length >= 4) pairWith(st.pin, st.ip || ''); }
+    else { st.mode = 'pin'; ui.redraw(); }
+  }, true);
+  textButton(p, 'pairfind', 64, 610, 700, 100, 'Искать ПК снова', async () => {
+    st.error = ''; st.busy = true; ui.redraw();
+    try { await fetch(PC_BASE + '__liquido/discover', { cache: 'no-store' }); } catch { /* ignore */ }
+    st.busy = false;
+    if (await checkAccount()) { openSource('root'); ui.openLibrary(true); }
+  });
+  textButton(p, 'pairmode', 64, 740, 700, 100, mode === 'pin' ? 'Ввести адрес ПК вручную' : 'Назад к PIN', () => {
+    st.mode = mode === 'pin' ? 'ip' : 'pin'; ui.redraw();
+  });
+
+  // цифровая клавиатура справа
+  const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', mode === 'ip' ? '.' : '', '0', '⌫'];
+  const kx = 880, ky = 260, kw = 200, kh = 170, gap = 20;
+  keys.forEach((k, i) => {
+    if (!k) return;
+    const x = kx + (i % 3) * (kw + gap), y = ky + Math.floor(i / 3) * (kh + gap);
+    textButton(p, 'key' + i, x, y, kw, kh, k, () => {
+      if (k === '⌫') setVal(val.slice(0, -1));
+      else if (mode === 'pin' ? val.length < 6 : val.length < 15) setVal(val + k);
+    });
+  });
+  p.end();
+}
+
 // превью для VR-библиотеки: только свои (same-origin), иначе canvas станет «грязным» для WebGL
 const vrThumbs = new Map();
 function vrThumb(f) {
@@ -1427,14 +1521,17 @@ class VRUI {
     this.settings.draw = () => drawSettings(this.settings);
     this.library = new CanvasPanel(1600, 1180, 1.2);
     this.library.draw = () => drawLibrary(this.library);
-    for (const s of [this.settings, this.library]) {
+    this.pairPanel = new CanvasPanel(1600, 1180, 1.2);
+    this.pairPanel.draw = () => drawPair(this.pairPanel);
+    this.pair = { mode: 'pin', pin: '', ip: '' };
+    for (const s of [this.settings, this.library, this.pairPanel]) {
       s.mesh.position.set(0, 0.16, -1.4);
       s.mesh.rotation.x = -0.1;
     }
     this.toast = new CanvasPanel(1100, 130, 0.62);
     this.toast.mesh.position.set(0, -0.2, -1.2);
     this.toast.mesh.renderOrder = 1002;
-    parent.add(this.main.mesh, this.settings.mesh, this.library.mesh, this.toast.mesh);
+    parent.add(this.main.mesh, this.settings.mesh, this.library.mesh, this.pairPanel.mesh, this.toast.mesh);
     this.visible = false;
     this.sheet = null; // 'settings' | 'library' | null
     this.tab = 'video';
@@ -1450,6 +1547,7 @@ class VRUI {
     this.main.mesh.visible = v;
     this.settings.mesh.visible = v && this.sheet === 'settings';
     this.library.mesh.visible = v && this.sheet === 'library';
+    this.pairPanel.mesh.visible = v && this.sheet === 'pair';
     if (v) { this.lastActivity = now(); this.redraw(); }
   }
   toggle() { this.setVisible(!this.visible); }
@@ -1468,7 +1566,7 @@ class VRUI {
     }
     this.openSheet('library', open);
   }
-  interactive() { return [this.main, this.settings, this.library]; }
+  interactive() { return [this.main, this.settings, this.library, this.pairPanel]; }
   panels() { return this.interactive().filter((p) => p.mesh.visible); }
   redraw() { for (const p of this.panels()) p.draw(); }
   toastMsg(text, warn = false, ms) {
@@ -1871,7 +1969,7 @@ async function init() {
   // В приложении LiquidoVR (Quest) сразу входим в VR и открываем библиотеку:
   // запуск по иконке считается действием пользователя для requestSession.
   if (IS_APP && xrSupported && !new URLSearchParams(location.search).get('demo')) {
-    enterVR().then((ok) => { if (ok) ui.openLibrary(true); });
+    enterVR().then((ok) => { if (ok && !ui.sheet) ui.openLibrary(true); });
   }
   if (!xrSupported) $('#btnVR').title = 'VR доступен в браузере Meta Quest';
 
