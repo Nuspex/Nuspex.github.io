@@ -77,9 +77,13 @@
         <button id="btnBack" class="btn ghost small">← Библиотека</button>
         <div id="nowTitle"></div>
         <span id="nowFmt" class="eyebrow"></span>
+        <button id="btnFull" class="btn ghost small" title="На весь экран (F, двойной клик)">
+          <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg><span>На весь экран</span>
+        </button>
       </div>
 
       <div id="stage">
+        <video id="video" playsinline preload="auto"></video>
         <div id="stageMsg"></div>
         <button id="btnVR" class="vr-cta">
           <svg viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4l-2-3h-2l-2 3H5a2 2 0 0 1-2-2Z"/><circle cx="8" cy="11.5" r="1.6"/><circle cx="16" cy="11.5" r="1.6"/></svg>
@@ -164,6 +168,5 @@
     </form>
   </dialog>
 
-  <video id="video" playsinline preload="auto"></video>
 </body>
 </html>

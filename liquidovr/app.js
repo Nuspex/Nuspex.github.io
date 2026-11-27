@@ -987,6 +987,7 @@ function initScene() {
       renderer.xr.getBaseLayer() instanceof XRProjectionLayer;
     updateMediaLayer();
     recenterFrames = 3;
+    updateNativeMode();
     ui.setVisible(true);
     $('#btnVR span').textContent = 'Выйти из VR';
     video.play().catch(() => {});
@@ -1000,6 +1001,7 @@ function initScene() {
     world.rotation.set(0, 0, 0);
     baseYaw = 0; basePitch = 0; tilt = 0;
     $('#btnVR span').textContent = 'Смотреть в VR';
+    updateNativeMode();
     onResize();
   });
 
@@ -1191,8 +1193,32 @@ void main() {`)
   updateMipmaps();
   applyZoom();
   updateMediaLayer();
+  updateNativeMode();
   ui?.redraw();
 }
+
+// ── ПК: обычное (плоское 2D) видео показываем настоящим <video> браузера — чётче и без нагрузки 3D-сцены.
+// В VR и для 180°/360°/3D остаётся 3D-сцена. На весь экран: кнопка, двойной клик или клавиша F.
+let nativeOn = false;
+function updateNativeMode() {
+  const on = !!current && !renderer?.xr?.isPresenting && state.projection === 'flat' && state.stereo === 'mono';
+  if (on === nativeOn) return;
+  nativeOn = on;
+  document.body.classList.toggle('native-video', on);
+  $('#btnVR').hidden = on && !xrSupported;
+  if (!on && document.fullscreenElement === video) document.exitFullscreen().catch(() => {});
+}
+function toggleFullscreen() {
+  if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+  const el = nativeOn ? video : $('#stage');
+  el.requestFullscreen?.().catch((e) => stageMsg('Не удалось открыть на весь экран: ' + e.message));
+}
+document.addEventListener('fullscreenchange', () => {
+  video.controls = document.fullscreenElement === video;   // во весь экран — стандартные кнопки браузера
+  onResize();
+});
+video.addEventListener('click', () => { if (nativeOn && !video.controls) togglePlay(); });
+video.addEventListener('dblclick', (e) => { if (nativeOn) { e.preventDefault(); toggleFullscreen(); } });
 
 // ───────── регулировка картинки ─────────
 const PIC_UNIFORMS = {
@@ -2422,6 +2448,7 @@ function renderFrame() {
     const hovering = updatePointers();
     ui.tick(now(), hovering);
   } else {
+    if (nativeOn) return;               // видео показывает сам браузер — 3D-сцену не рисуем
     camera.rotation.set(pitch, yaw, 0, 'YXZ');
   }
   renderer.render(scene, camera);
@@ -2563,6 +2590,7 @@ function showBrowser() {
   if (video.getAttribute('src')) { video.removeAttribute('src'); video.load(); }
   renderer?.setAnimationLoop(null);
   current = null;
+  updateNativeMode();
   $('#viewPlayer').hidden = true;
   $('#viewBrowser').hidden = false;
   stageMsg('');
@@ -2678,6 +2706,7 @@ function bindUI() {
   $('#showAll').onchange = () => loadList(true);
   $('#btnMore').onclick = () => loadList(false);
   $('#btnBack').onclick = showBrowser;
+  $('#btnFull').onclick = toggleFullscreen;
   $('#btnVR').onclick = () => { if (renderer?.xr?.isPresenting) renderer.xr.getSession().end(); else enterVR(); };
   $('#cPlay').onclick = togglePlay;
   $('#cBack').onclick = () => seekBy(-seekStep());
@@ -2714,8 +2743,9 @@ function bindUI() {
     if ($('#viewPlayer').hidden || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName)) return;
     // горячие клавиши как в PLAY'A
     if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
-    else if (e.code === 'ArrowLeft') seekBy(-seekStep());
-    else if (e.code === 'ArrowRight') seekBy(seekStep());
+    else if (e.code === 'KeyF') { e.preventDefault(); toggleFullscreen(); }
+    else if (e.code === 'ArrowLeft') { e.preventDefault(); seekBy(-seekStep()); }
+    else if (e.code === 'ArrowRight') { e.preventDefault(); seekBy(seekStep()); }
     else if (e.code === 'ArrowUp') { e.preventDefault(); setVolume(video.volume + 0.05); }
     else if (e.code === 'ArrowDown') { e.preventDefault(); setVolume(video.volume - 0.05); }
     else if (e.code === 'KeyM') video.muted = !video.muted;
