@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.liquidovr.launcher",
+      "sha256_cert_fingerprints": [
+        "E6:14:31:60:4F:94:E7:D9:E8:B7:86:B6:DA:C7:AD:A5:78:C8:22:59:75:F3:1E:8B:3D:47:3C:B4:18:66:18:1B"
+      ]
+    }
+  }
+]

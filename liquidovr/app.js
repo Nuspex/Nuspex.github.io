@@ -1,0 +1,1899 @@
+// LiquidoVR — WebXR-плеер видео с Google Диска без скачивания.
+import * as THREE from 'three';
+
+// ───────────────────────── утилиты ─────────────────────────
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } },
+  del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
+};
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(sec).padStart(2, '0');
+}
+function fmtBytes(n) {
+  n = Number(n);
+  if (!n) return '';
+  const u = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i > 1 ? 1 : 0) + ' ' + u[i];
+}
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+// Где программа на ПК: если плеер открыт с самого ПК-сервера — тот же адрес,
+// если с сайта (GitHub Pages, приложение LiquidoVR) — через localhost:8080 на шлеме
+// (посредник приложения по Wi-Fi или adb reverse по кабелю).
+const PC_BASE = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? '' : 'http://localhost:8080/';
+const IS_APP = matchMedia('(display-mode: standalone)').matches || 'getDigitalGoodsService' in window ||
+  document.referrer.startsWith('android-app://');
+const now = () => performance.now();
+
+const ICONS = {
+  folder: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
+  film: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>',
+  file: '<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15l13-7.5Z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><rect x="6" y="4.5" width="4" height="15" rx="1"/><rect x="14" y="4.5" width="4" height="15" rx="1"/></svg>',
+};
+
+// ───────────────────────── константы и настройки ─────────────────────────
+const DRIVE = 'https://www.googleapis.com/drive/v3';
+const FOLDER = 'application/vnd.google-apps.folder';
+const SHORTCUT = 'application/vnd.google-apps.shortcut';
+const FILE_FIELDS = 'id,name,mimeType,size,thumbnailLink,modifiedTime,videoMediaMetadata(width,height,durationMillis),shortcutDetails(targetId,targetMimeType)';
+
+const PROJ = ['flat', '180', '360', 'fisheye'];
+const PROJ_NAME = { flat: 'Экран', 180: '180°', 360: '360°', fisheye: 'Fisheye' };
+const STEREO = ['mono', 'sbs', 'tb'];
+const STEREO_NAME = { mono: '2D', sbs: 'SBS 3D', tb: 'TB 3D' };
+const STEREO_LONG = { mono: '2D', sbs: 'Side-by-Side', tb: 'Top-Bottom' };
+const QUALITY = {
+  std: { name: 'Стандарт', scale: 1.0, seg: 64 },
+  high: { name: 'Высокое', scale: 1.25, seg: 96 },
+  '8k': { name: '8K', scale: 1.5, seg: 128 },
+};
+const QUALITY_KEYS = ['std', 'high', '8k'];
+const DEFAULT_PREFS = {
+  projection: '180', stereo: 'sbs', swap: false, zoom: 0, quality: '8k', autoVR: true, volume: 1, layers: true,
+  speed: 1, autoNext: true, fisheyeFov: 180, picture: { b: 0, c: 0, s: 0 },
+};
+let prefs = { ...DEFAULT_PREFS, ...LS.get('liquido.prefs', {}) };
+prefs.picture = { b: 0, c: 0, s: 0, ...(prefs.picture || {}) };
+const savePrefs = () => LS.set('liquido.prefs', prefs);
+
+// ───────────────────────── баннер / статус ─────────────────────────
+function banner(text, btnText, onClick) {
+  const b = $('#banner');
+  if (!text) { b.hidden = true; return; }
+  $('#bannerText').textContent = text;
+  const btn = $('#bannerBtn');
+  btn.hidden = !btnText;
+  btn.textContent = btnText || '';
+  btn.onclick = onClick || null;
+  b.hidden = false;
+}
+function listStatus(text, isError) {
+  const el = $('#listStatus');
+  el.textContent = text || '';
+  el.classList.toggle('error', !!isError);
+}
+function stageMsg(text) { $('#stageMsg').textContent = text || ''; }
+
+// ───────────────────────── авторизация через ПК-сервер ─────────────────────────
+// Вход в Google делается ОДИН раз в браузере компьютера (http://127.0.0.1:8080/setup).
+// Шлем получает у ПК-сервера только короткоживущий access token — входить на Quest не нужно.
+let token = null;
+let tokenExp = 0;
+let account = null;
+const hasToken = () => !!token && Date.now() < tokenExp - 60000;
+class NeedLogin extends Error {}
+
+async function serverJSON(path) {
+  let r;
+  try {
+    r = await fetch(PC_BASE + path, { cache: 'no-store', headers: { 'X-Liquido': '1' } });
+  } catch {
+    throw new Error('Нет связи с программой на ПК. Запустите «Запустить.cmd» на компьютере.');
+  }
+  if (r.status === 401) throw new NeedLogin('Нужно войти в Google на компьютере.');
+  if (!r.ok) {
+    let m = 'HTTP ' + r.status;
+    try { m = (await r.json()).error || m; } catch { /* ignore */ }
+    throw new Error('Программа на ПК: ' + m);
+  }
+  return r.json();
+}
+
+async function getToken(force = false) {
+  if (!force && hasToken()) return token;
+  try {
+    const j = await serverJSON('api/token' + (force ? '?force=1' : ''));
+    token = j.access_token;
+    tokenExp = j.expires_at * 1000;
+  } catch (e) {
+    if (e instanceof NeedLogin) { account = null; updateAuthUI(); showLoginHelp(true); }
+    throw e;
+  }
+  await sendAuthToSW();
+  return token;
+}
+
+function showLoginHelp(configured) {
+  banner((configured ? 'Google Диск не подключён.' : 'Программа на ПК ещё не настроена.') +
+    ' На компьютере откройте в браузере http://127.0.0.1:8080/setup и войдите в Google, затем нажмите «Проверить».',
+  'Проверить', async () => { if (await checkAccount()) openSource('root'); });
+}
+
+async function checkAccount() {
+  try {
+    const s = await serverJSON('api/status');
+    account = s.signedIn ? s : null;
+    if (account) { banner(null); await getToken(); } else showLoginHelp(s.configured);
+  } catch (e) {
+    account = null;
+    banner(e.message, 'Повторить', async () => { if (await checkAccount()) openSource('root'); });
+  }
+  updateAuthUI();
+  return !!account;
+}
+
+function updateAuthUI() {
+  const who = $('#who');
+  who.textContent = account ? '● ' + (account.name || account.email || 'Google Диск') : 'Диск не подключён';
+  who.classList.toggle('ok', !!account);
+  $('#btnLogin').hidden = !!account;
+}
+
+setInterval(() => {
+  if (account && token && Date.now() > tokenExp - 10 * 60000) getToken(true).catch(() => {});
+}, 60000);
+
+// ───────────────────────── Drive API ─────────────────────────
+async function api(path, params = {}, retry = true) {
+  const url = new URL(DRIVE + path);
+  for (const [k, v] of Object.entries(params)) if (v != null && v !== '') url.searchParams.set(k, v);
+  const t = await getToken();
+  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + t } });
+  if (r.status === 401 && retry) { await getToken(true); return api(path, params, false); }
+  if (!r.ok) {
+    let msg = 'HTTP ' + r.status;
+    try { const j = await r.json(); msg = j.error?.message || msg; } catch { /* ignore */ }
+    throw new Error('Google Drive: ' + msg);
+  }
+  return r.json();
+}
+
+// ───────────────────────── service worker ─────────────────────────
+let swReg = null;
+async function ensureSW() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) {
+    throw new Error('Потоковое воспроизведение работает только по адресу http://localhost:8080 (через adb reverse).');
+  }
+  if (!swReg) swReg = await navigator.serviceWorker.register('./sw.js');
+  await navigator.serviceWorker.ready;
+  if (!navigator.serviceWorker.controller) {
+    await new Promise((r) => {
+      navigator.serviceWorker.addEventListener('controllerchange', r, { once: true });
+      setTimeout(r, 3000);
+    });
+  }
+  if (!navigator.serviceWorker.controller) {
+    throw new Error('Service Worker ещё не активен. Обновите страницу обычным способом.');
+  }
+}
+
+async function sendAuthToSW() {
+  if (!('serviceWorker' in navigator)) return;
+  const target = navigator.serviceWorker.controller || swReg?.active;
+  if (!target) return;
+  const auth = hasToken() ? { token, exp: tokenExp } : null;
+  await new Promise((res) => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => res();
+    target.postMessage({ type: 'auth', auth }, [ch.port2]);
+    setTimeout(res, 1500);
+  });
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const d = e.data || {};
+    if (d.type === 'need-login') {
+      account = null; updateAuthUI(); showLoginHelp(true);
+      ui?.toastMsg('Диск отключён — войдите на ПК (/setup)', true);
+    } else if (d.type === 'server-down') {
+      banner('Нет связи с программой на ПК — запустите «Запустить.cmd» и проверьте кабель.');
+      ui?.toastMsg('Нет связи с ПК', true);
+    } else if (d.type === 'forbidden') {
+      const quota = /quota|limit/i.test(d.detail || '');
+      const t = quota ? 'Google временно ограничил скачивание этого файла (квота). Попробуйте позже.' : 'Нет доступа к файлу (403).';
+      banner(t); ui?.toastMsg(t, true);
+    } else if (d.type === 'stream-error' || d.type === 'server-error') {
+      banner('Ошибка потока: HTTP ' + d.status);
+    }
+  });
+}
+
+// ───────────────────────── формат видео ─────────────────────────
+function detectFormat(name) {
+  const n = (name || '').toLowerCase();
+  const has = (re) => re.test(n);
+  let projection = prefs.projection, stereo = prefs.stereo;
+  let marked = true;
+  if (has(/fisheye|[_\-. ]fe[_\-. ]|mkx200|vrca220|rf52/)) projection = 'fisheye';
+  else if (has(/360/)) projection = '360';
+  else if (has(/180|vr180/)) projection = '180';
+  else if (has(/[_\-. ](2d|flat)[_\-. ]/)) projection = 'flat';
+  else marked = false;
+  if (has(/sbs|[_\-. ]lr[_\-. ]|[_\-. ]3dh|side.?by.?side/)) stereo = 'sbs';
+  else if (has(/[_\-. ](tb|ou)[_\-. ]|[_\-. ]3dv|top.?bottom|over.?under/)) stereo = 'tb';
+  else if (has(/[_\-. ](2d|mono)[_\-. ]/)) stereo = 'mono';
+  return { projection, stereo, swap: prefs.swap, marked };
+}
+
+// Формат из метаданных файла (ffprobe на ПК) — когда в имени нет меток. Результат кешируется.
+async function probeFormat(f) {
+  const key = 'liquido.meta.' + f.id;
+  let meta = LS.get(key, null);
+  if (!meta) {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 6000);
+      const r = await fetch(PC_BASE + 'api/meta?id=' + encodeURIComponent(f.id), { headers: { 'X-Liquido': '1' }, signal: ctl.signal });
+      clearTimeout(timer);
+      meta = r.ok ? await r.json() : null;
+      if (meta) LS.set(key, meta);
+    } catch { meta = null; }
+  }
+  return meta || {};
+}
+function fileFormat(f) {
+  const saved = LS.get('liquido.fmt.' + f.id, null);
+  return { ...detectFormat(f.name), zoom: prefs.zoom, height: 0, ...(saved || {}) };
+}
+function formatLabel(fmt) {
+  if (fmt.projection === 'flat') return fmt.stereo === 'mono' ? '2D' : '3D ' + (fmt.stereo === 'sbs' ? 'SBS' : 'TB');
+  return PROJ_NAME[fmt.projection] + (fmt.stereo === 'mono' ? '' : ' 3D');
+}
+function guessMime(f) {
+  if ((f.mimeType || '').startsWith('video/')) return f.mimeType;
+  const n = (f.name || '').toLowerCase();
+  if (n.endsWith('.mkv')) return 'video/x-matroska';
+  if (n.endsWith('.webm')) return 'video/webm';
+  if (n.endsWith('.mov')) return 'video/quicktime';
+  return 'video/mp4';
+}
+
+// ───────────────────────── обзор Диска ─────────────────────────
+const nav = { source: 'root', stack: [], query: '', pageToken: null, loading: false, items: [] };
+const VIDEO_Q = `(mimeType='${FOLDER}' or mimeType contains 'video/' or mimeType='${SHORTCUT}')`;
+const esc = (s) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+function setActiveTab(src) { $$('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.src === src)); }
+
+function openSource(src) {
+  setActiveTab(src);
+  nav.source = src;
+  nav.stack = src === 'root' ? [{ id: 'root', name: 'Мой диск' }] : [];
+  loadList(true);
+}
+
+function currentQuery() {
+  const all = $('#showAll').checked;
+  const filt = all ? '' : ' and ' + VIDEO_Q;
+  if (nav.stack.length) {
+    const id = nav.stack[nav.stack.length - 1].id;
+    return { q: `'${esc(id)}' in parents and trashed=false` + filt, orderBy: 'folder,name' };
+  }
+  if (nav.source === 'shared') return { q: 'sharedWithMe and trashed=false' + filt };
+  if (nav.source === 'recent') return { q: "trashed=false and mimeType contains 'video/'", orderBy: 'viewedByMeTime desc' };
+  if (nav.source === 'search') return { q: `name contains '${esc(nav.query)}' and trashed=false` + filt, orderBy: 'folder,name' };
+  return { q: "'root' in parents and trashed=false" + filt, orderBy: 'folder,name' };
+}
+
+async function loadList(reset) {
+  if (nav.loading) return;
+  if (!account) {
+    $('#list').replaceChildren();
+    renderCrumbs();
+    listStatus('Google Диск не подключён.\n1. На компьютере запустите «Запустить.cmd».\n2. В браузере ПК откройте http://127.0.0.1:8080/setup и войдите в Google.\n3. Здесь нажмите «Проверить подключение».');
+    $('#btnMore').hidden = true;
+    return;
+  }
+  if (reset) { nav.pageToken = null; nav.items = []; $('#list').replaceChildren(); }
+  renderCrumbs();
+  nav.loading = true;
+  listStatus('Загрузка…');
+  try {
+    const { q, orderBy } = currentQuery();
+    const r = await api('/files', {
+      q, orderBy, pageSize: 100, pageToken: nav.pageToken,
+      fields: 'nextPageToken,files(' + FILE_FIELDS + ')',
+      supportsAllDrives: true, includeItemsFromAllDrives: true,
+    });
+    const files = r.files || [];
+    if (nav.source === 'shared' && !nav.stack.length) {
+      files.sort((a, b) => (b.mimeType === FOLDER) - (a.mimeType === FOLDER) || a.name.localeCompare(b.name));
+    }
+    nav.items.push(...files);
+    nav.pageToken = r.nextPageToken || null;
+    renderItems(files);
+    listStatus(nav.items.length ? '' : 'Здесь нет видео.');
+    $('#btnMore').hidden = !nav.pageToken;
+  } catch (e) {
+    listStatus(e.message, true);
+  } finally {
+    nav.loading = false;
+    ui?.redraw();
+  }
+}
+
+function renderCrumbs() {
+  const c = $('#crumbs');
+  c.replaceChildren();
+  const label = { shared: 'Доступные мне', recent: 'Недавние видео', search: 'Поиск: ' + nav.query }[nav.source];
+  if (label) {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { nav.stack = []; loadList(true); };
+    c.append(b);
+  }
+  nav.stack.forEach((f, i) => {
+    if (c.children.length) { const s = document.createElement('span'); s.textContent = '›'; c.append(s); }
+    const b = document.createElement('button');
+    b.textContent = f.name;
+    b.onclick = () => { nav.stack = nav.stack.slice(0, i + 1); loadList(true); };
+    c.append(b);
+  });
+}
+
+// Превью: кадр из случайной секунды в середине видео (генерирует ПК через ffmpeg)
+const thumbQueue = [];
+let thumbActive = 0;
+function queueThumb(fn) { thumbQueue.push(fn); pumpThumbs(); }
+function pumpThumbs() {
+  while (thumbActive < 3 && thumbQueue.length) {
+    const fn = thumbQueue.shift();
+    thumbActive++;
+    fn().finally(() => { thumbActive--; pumpThumbs(); });
+  }
+}
+const thumbObserver = 'IntersectionObserver' in window ? new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    thumbObserver.unobserve(e.target);
+    e.target._loadThumb?.();
+  }
+}, { rootMargin: '300px' }) : null;
+
+// адрес превью закрепляется при первом показе → дальше картинка берётся из кеша браузера
+function ownThumbUrl(f) {
+  const key = 'liquido.thumb.' + f.id;
+  let q = LS.get(key, null);
+  if (!q) {
+    const fmt = fileFormat(f);
+    const dur = (f.videoMediaMetadata?.durationMillis || 0) / 1000;
+    q = `v=2&proj=${fmt.projection}&stereo=${fmt.stereo}&dur=${dur.toFixed(1)}`;
+    LS.set(key, q);
+  }
+  return `${PC_BASE}thumb/${encodeURIComponent(f.id)}.jpg?${q}`;
+}
+
+function attachThumb(thumbEl, f) {
+  const shimmer = document.createElement('div');
+  shimmer.className = 'shimmer';
+  thumbEl.append(shimmer);
+  const tryLoad = (src) => new Promise((resolve) => {
+    const img = new Image();
+    img.decoding = 'async';
+    img.referrerPolicy = 'no-referrer';
+    if (src.startsWith(PC_BASE + 'thumb/')) img.crossOrigin = 'anonymous';
+    img.alt = '';
+    img.onload = () => { thumbEl.append(img); requestAnimationFrame(() => img.classList.add('loaded')); resolve(true); };
+    img.onerror = () => resolve(false);
+    img.src = src;
+  });
+  thumbEl._loadThumb = () => queueThumb(async () => {
+    const own = ownThumbUrl(f);
+    const ok = await tryLoad(own) || (f.thumbnailLink && await tryLoad(f.thumbnailLink));
+    shimmer.remove();
+    return ok;
+  });
+  if (thumbObserver) thumbObserver.observe(thumbEl); else thumbEl._loadThumb();
+}
+
+function renderItems(files) {
+  const list = $('#list');
+  for (const f of files) {
+    const targetMime = f.shortcutDetails?.targetMimeType || f.mimeType || '';
+    const isFolder = targetMime === FOLDER;
+    const isVideo = targetMime.startsWith('video/');
+    const card = document.createElement('button');
+    const info = document.createElement('div');
+    info.className = 'info';
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = f.name;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    info.append(name, meta);
+
+    if (isFolder) {
+      card.className = 'card folder';
+      const ic = document.createElement('div');
+      ic.className = 'ficon';
+      ic.innerHTML = ICONS.folder;
+      meta.textContent = 'Папка';
+      card.append(ic, info);
+    } else {
+      card.className = 'card';
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      thumb.innerHTML = isVideo ? ICONS.film : ICONS.file;
+      const vm = f.videoMediaMetadata;
+      if (isVideo) {
+        const fmt = fileFormat(f);
+        const b = document.createElement('span');
+        b.className = 'badge fmt';
+        b.textContent = formatLabel(fmt);
+        thumb.append(b);
+        if (vm?.durationMillis) {
+          const d = document.createElement('span');
+          d.className = 'badge dur';
+          d.textContent = fmtTime(vm.durationMillis / 1000);
+          thumb.append(d);
+        }
+        const ph = document.createElement('div');
+        ph.className = 'play-hint';
+        ph.innerHTML = ICONS.play;
+        thumb.append(ph);
+        if (f.mimeType !== SHORTCUT) attachThumb(thumb, f);
+      }
+      meta.textContent = [vm?.width ? (vm.width >= 7000 ? '8K' : vm.width >= 3800 ? '4K' : vm.width + '×' + vm.height) : '', fmtBytes(f.size)]
+        .filter(Boolean).join(' · ');
+      card.append(thumb, info);
+    }
+    card.onclick = () => {
+      if (isVideo && prefs.autoVR && xrSupported) enterVR(); // вход в VR сразу по клику (нужен жест пользователя)
+      openItem(f);
+    };
+    list.append(card);
+  }
+}
+
+async function openItem(f) {
+  try {
+    if (f.mimeType === SHORTCUT) {
+      const t = await api('/files/' + encodeURIComponent(f.shortcutDetails.targetId), { fields: FILE_FIELDS, supportsAllDrives: true });
+      return openItem(t);
+    }
+    if (f.mimeType === FOLDER) {
+      nav.stack.push({ id: f.id, name: f.name });
+      return loadList(true);
+    }
+    await playFile(f);
+  } catch (e) {
+    if (renderer?.xr?.isPresenting) renderer.xr.getSession()?.end();
+    banner(e.message);
+  }
+}
+
+function parseDriveId(text) {
+  text = (text || '').trim();
+  const m = /\/folders\/([\w-]{10,})/.exec(text) || /\/file\/d\/([\w-]{10,})/.exec(text) ||
+    /[?&]id=([\w-]{10,})/.exec(text) || /^([\w-]{20,})$/.exec(text);
+  return m ? m[1] : null;
+}
+
+async function openLink(text) {
+  const id = parseDriveId(text);
+  if (!id) { banner('Не похоже на ссылку Google Диска.'); return; }
+  try {
+    const f = await api('/files/' + encodeURIComponent(id), { fields: FILE_FIELDS, supportsAllDrives: true });
+    if (f.mimeType === FOLDER) {
+      showBrowser();
+      setActiveTab(null);
+      nav.source = 'link';
+      nav.stack = [{ id: f.id, name: f.name }];
+      return loadList(true);
+    }
+    await openItem(f);
+  } catch (e) {
+    banner(e.message);
+  }
+}
+
+// ───────────────────────── 3D-сцена ─────────────────────────
+const video = $('#video');
+const R = 10;           // радиус сферы
+const SCREEN_W = 4;     // ширина виртуального экрана, м
+// Зум: −1 … +1. Минус — отдалить (видео превращается в «окно» впереди, до 5× меньше),
+// плюс — приблизить. 0 — обычный размер.
+const FLAT_BASE = 5;    // дистанция экрана при зуме 0, м
+const FLAT_FAR = 20;    // при зуме −100 %
+const FLAT_NEAR = 1.3;  // при зуме +100 %
+// Отдаление как в популярных плеерах: купол 180° целиком уезжает вдаль (край остаётся круглым,
+// без «квадратной рамки»). Для 360 — в пределах сферы, чтобы не оказаться снаружи шара.
+const zoomAngle = () => 1;
+const zoomOffset = (z) => {
+  if (z >= 0) return z * 0.55 * R;                                     // приближение: сфера ближе
+  return z * (state.projection === '360' ? 0.85 : 3.2) * R;            // отдаление: купол уезжает вперёд
+};
+const domeAway = () => state.projection !== 'flat' && state.zoom < -0.001;
+const flatDist = (z) => (z < 0 ? THREE.MathUtils.lerp(FLAT_BASE, FLAT_FAR, -z) : THREE.MathUtils.lerp(FLAT_BASE, FLAT_NEAR, z));
+const fmtZoom = (z) => (z > 0.005 ? '+' : z < -0.005 ? '−' : '') + Math.round(Math.abs(z) * 100) + '%';
+let baseYaw = 0, basePitch = 0, tilt = 0; // ориентация видео в VR (центр + наклон стиком)
+let baseDirs = null, lastAngle = -1;     // исходные направления вершин сферы (для зума в WebGL)
+
+const state = { projection: prefs.projection, stereo: prefs.stereo, swap: prefs.swap, zoom: prefs.zoom, height: 0 };
+let renderer, scene, camera, world, mediaGroup, videoTex, ui;
+const controllers = [];
+let current = null;
+let currentSrc = '';
+let yaw = 0, pitch = 0;
+let recenterFrames = 0;
+let lastPosSave = 0;
+let xrSupported = false;
+
+function buildEnvironment() {
+  const env = new THREE.Group();
+  const cv = document.createElement('canvas');
+  cv.width = 8; cv.height = 256;
+  const cx = cv.getContext('2d');
+  const g = cx.createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0, '#16204a');
+  g.addColorStop(0.42, '#0b1026');
+  g.addColorStop(0.52, '#070912');
+  g.addColorStop(1, '#030407');
+  cx.fillStyle = g;
+  cx.fillRect(0, 0, 8, 256);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(60, 48, 24),
+    new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, depthWrite: false }));
+  dome.renderOrder = -2;
+  dome.name = 'dome';
+  env.add(dome);
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(3, 96),
+    new THREE.MeshBasicMaterial({ color: 0x0c1124, transparent: true, opacity: 0.85, depthWrite: false }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -1.6;
+  floor.renderOrder = -1;
+  floor.name = 'floor';
+  env.add(floor);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(2.96, 3.0, 128),
+    new THREE.MeshBasicMaterial({ color: 0x35d0ff, transparent: true, opacity: 0.35, depthWrite: false }));
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = -1.599;
+  ring.name = 'ring';
+  env.add(ring);
+  // звёзды
+  const pts = [];
+  for (let i = 0; i < 900; i++) {
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(55);
+    if (v.y > -5) pts.push(v);
+  }
+  const stars = new THREE.Points(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.PointsMaterial({ color: 0x9fb8ff, size: 0.12, transparent: true, opacity: 0.7, depthWrite: false }));
+  stars.name = 'stars';
+  env.add(stars);
+  return env;
+}
+
+function initScene() {
+  if (renderer) return;
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local');
+  renderer.xr.setFoveation(0); // без размытия по краям (по умолчанию three.js включает максимум)
+  $('#stage').prepend(renderer.domElement);
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x030407);
+  camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.05, 200);
+  camera.layers.enable(1); // вне VR показываем левый глаз
+  scene.add(camera);
+
+  world = new THREE.Group();
+  scene.add(world);
+  world.add(buildEnvironment());
+  mediaGroup = new THREE.Group();
+  world.add(mediaGroup);
+
+  ui = new VRUI(world);
+
+  for (let i = 0; i < 2; i++) {
+    const c = renderer.xr.getController(i);
+    const ray = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.0015, 0.004, 1, 8, 1, true).translate(0, 0.5, 0).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0x7fd8ff, transparent: true, opacity: 0.55, depthWrite: false })
+    );
+    ray.scale.z = 3;
+    const dot = new THREE.Mesh(new THREE.CircleGeometry(0.008, 24),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true }));
+    dot.renderOrder = 1001;
+    dot.visible = false;
+    c.add(ray);
+    scene.add(dot);
+    c.userData = { ray, dot, hit: null, drag: null, hoverId: null, source: null };
+    c.visible = false;
+    c.addEventListener('connected', (e) => { c.userData.source = e.data; c.visible = !!e.data.gamepad; });
+    c.addEventListener('disconnected', () => { c.visible = false; c.userData.source = null; dot.visible = false; });
+    c.addEventListener('selectstart', () => onSelectStart(c));
+    c.addEventListener('selectend', () => { c.userData.drag = null; });
+    scene.add(c);
+    controllers.push(c);
+  }
+
+  renderer.xr.addEventListener('sessionstart', () => {
+    camera.layers.disable(1); // каждый глаз видит свой слой: 1 — левый, 2 — правый
+    renderer.xr.setFoveation(0);
+    // WebXR Media Layers: видео выводит сам шлем в родном разрешении (максимальная чёткость)
+    xrLayersOK = typeof XRMediaBinding !== 'undefined' && typeof XRProjectionLayer !== 'undefined' &&
+      renderer.xr.getBaseLayer() instanceof XRProjectionLayer;
+    updateMediaLayer();
+    recenterFrames = 3;
+    ui.setVisible(true);
+    $('#btnVR span').textContent = 'Выйти из VR';
+    video.play().catch(() => {});
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    camera.layers.enable(1);
+    mediaLayer = null; mediaBinding = null; mediaLayerKey = ''; xrLayersOK = false;
+    setSceneForLayer(false);
+    ui.setVisible(false);
+    world.position.set(0, 0, 0);
+    world.rotation.set(0, 0, 0);
+    baseYaw = 0; basePitch = 0; tilt = 0;
+    $('#btnVR span').textContent = 'Смотреть в VR';
+    onResize();
+  });
+
+  const el = renderer.domElement;
+  let drag = null;
+  el.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; el.setPointerCapture(e.pointerId); });
+  el.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    yaw = drag.yaw + (e.clientX - drag.x) * 0.005;
+    pitch = clamp(drag.pitch + (e.clientY - drag.y) * 0.005, -1.5, 1.5);
+  });
+  el.addEventListener('pointerup', () => { drag = null; });
+  el.addEventListener('wheel', (e) => { e.preventDefault(); setZoom(state.zoom - e.deltaY * 0.001); }, { passive: false });
+  new ResizeObserver(onResize).observe($('#stage'));
+  onResize();
+}
+
+function onResize() {
+  if (!renderer || renderer.xr.isPresenting) return;
+  const st = $('#stage');
+  const w = st.clientWidth || 640, h = st.clientHeight || 360;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+
+function disposeMedia() {
+  for (const m of [...mediaGroup.children]) {
+    mediaGroup.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
+  }
+}
+
+function fisheyeUV(geo, fovDeg = 180) {
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  const half = THREE.MathUtils.degToRad(fovDeg) / 2;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).normalize();
+    const theta = Math.acos(clamp(-v.z, -1, 1));
+    const a = Math.atan2(v.y, v.x);
+    const r = (theta / half) * 0.5;
+    uv.setXY(i, 0.5 + r * Math.cos(a), 0.5 + r * Math.sin(a));
+  }
+  uv.needsUpdate = true;
+}
+
+function eyeUV(geo, layout, eye) { // eye: 0 — левый, 1 — правый
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) {
+    let u = uv.getX(i), v = uv.getY(i);
+    if (layout === 'sbs') u = u * 0.5 + (eye ? 0.5 : 0);
+    else v = v * 0.5 + (eye ? 0 : 0.5); // верх кадра — левый глаз
+    uv.setXY(i, u, v);
+  }
+  uv.needsUpdate = true;
+}
+
+function rebuildMedia() {
+  if (!renderer) return;
+  disposeMedia();
+  const vw = video.videoWidth || 1920, vh = video.videoHeight || 1080;
+  const { projection, stereo, swap } = state;
+  const seg = QUALITY[prefs.quality]?.seg || 96;
+  let base;
+  if (projection === 'flat') {
+    let eyeAspect = vw / vh;
+    if (stereo === 'sbs') { eyeAspect /= 2; if (eyeAspect < 1.2) eyeAspect *= 2; }  // half-SBS
+    if (stereo === 'tb') { eyeAspect *= 2; if (eyeAspect > 2.6) eyeAspect /= 2; }   // half-TB
+    flatEye = { w: SCREEN_W, h: SCREEN_W / eyeAspect };
+    base = new THREE.PlaneGeometry(SCREEN_W, SCREEN_W / eyeAspect);
+  } else if (projection === '360') {
+    base = new THREE.SphereGeometry(R, seg * 1.5, seg, -1.5 * Math.PI, 2 * Math.PI);
+    base.scale(-1, 1, 1);
+  } else {
+    base = new THREE.SphereGeometry(R, seg, seg, -Math.PI, Math.PI);
+    base.scale(-1, 1, 1);
+    if (projection === 'fisheye') fisheyeUV(base, prefs.fisheyeFov || 180);
+  }
+  baseDirs = projection === 'flat' ? null : Float32Array.from(base.attributes.position.array);
+  lastAngle = -1;
+  const mat = () => {
+    const m = new THREE.MeshBasicMaterial({ map: videoTex || null, side: THREE.DoubleSide, toneMapped: false, color: videoTex ? 0xffffff : 0x10131c });
+    m.onBeforeCompile = (sh) => {
+      Object.assign(sh.uniforms, PIC_UNIFORMS);
+      sh.fragmentShader = sh.fragmentShader
+        .replace('void main() {', 'uniform float uBright;\nuniform float uContrast;\nuniform float uSat;\nvoid main() {')
+        .replace('#include <map_fragment>', `#include <map_fragment>
+          diffuseColor.rgb = (diffuseColor.rgb - 0.5) * uContrast + 0.5 + uBright;
+          float lum = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+          diffuseColor.rgb = clamp(mix(vec3(lum), diffuseColor.rgb, uSat), 0.0, 1.0);`);
+    };
+    m.customProgramCacheKey = () => 'liquido-picture';
+    return m;
+  };
+  if (stereo === 'mono') {
+    mediaGroup.add(new THREE.Mesh(base, mat()));
+  } else {
+    for (const eye of [0, 1]) {
+      const g = base.clone();
+      eyeUV(g, stereo, swap ? 1 - eye : eye);
+      const m = new THREE.Mesh(g, mat());
+      m.layers.set(eye === 0 ? 1 : 2);
+      mediaGroup.add(m);
+    }
+    base.dispose();
+  }
+  // пол виртуального зала — только для режима «Экран» (в 180/360 он оказался бы поверх видео)
+  for (const n of ['floor', 'ring']) { const o = scene.getObjectByName(n); if (o) o.visible = projection === 'flat'; }
+  applyZoom();
+  updateMediaLayer();
+  ui?.redraw();
+}
+
+// ───────── регулировка картинки ─────────
+const PIC_UNIFORMS = { uBright: { value: 0 }, uContrast: { value: 1 }, uSat: { value: 1 } };
+const pictureActive = () => ['b', 'c', 's'].some((k) => Math.abs(prefs.picture[k] || 0) > 0.005);
+function applyPicture() {
+  PIC_UNIFORMS.uBright.value = (prefs.picture.b || 0) * 0.25;
+  PIC_UNIFORMS.uContrast.value = 1 + (prefs.picture.c || 0) * 0.5;
+  PIC_UNIFORMS.uSat.value = 1 + (prefs.picture.s || 0);
+}
+applyPicture();
+function setPicture(k, v) {
+  const was = pictureActive();
+  prefs.picture[k] = Math.abs(v) < 0.03 ? 0 : clamp(v, -1, 1);
+  savePrefs();
+  applyPicture();
+  if (was !== pictureActive()) {
+    updateMediaLayer();
+    if (pictureActive() && prefs.layers !== false) ui?.toastMsg('Регулировка картинки работает в совместимом режиме вывода');
+  }
+}
+
+// ───────── WebXR Media Layers ─────────
+// Видео отдаётся компоновщику шлема напрямую (без перерисовки через WebGL): чётко и без нагрузки.
+let xrLayersOK = false, mediaBinding = null, mediaLayer = null, mediaLayerKey = '';
+let flatEye = { w: SCREEN_W, h: SCREEN_W * 9 / 16 };
+const BG_COLOR = new THREE.Color(0x030407);
+
+function layerWanted() {
+  return xrLayersOK && prefs.layers !== false && !!renderer?.xr?.isPresenting && video.videoWidth > 0 &&
+    state.projection !== 'fisheye' && !state.swap && !pictureActive() && !domeAway();
+}
+
+function setSceneForLayer(on) {
+  if (!scene) return;
+  mediaGroup.visible = !on;
+  for (const n of ['dome', 'stars']) { const o = scene.getObjectByName(n); if (o) o.visible = !on; }
+  scene.background = on ? null : BG_COLOR;
+  renderer.setClearColor(0x000000, on ? 0 : 1);
+}
+
+function layerTransform(dist) {
+  world.updateMatrixWorld(true);
+  const pt = new THREE.Vector3(0, state.height, -dist).applyMatrix4(world.matrixWorld);
+  const q = world.getWorldQuaternion(new THREE.Quaternion());
+  return new XRRigidTransform({ x: pt.x, y: pt.y, z: pt.z }, { x: q.x, y: q.y, z: q.z, w: q.w });
+}
+
+function applyLayerProps() {
+  if (!mediaLayer) return;
+  const z = state.zoom;
+  try {
+    if (state.projection === 'flat') {
+      mediaLayer.transform = layerTransform(flatDist(z));
+    } else {
+      const a = zoomAngle(z); // слой растягивает весь кадр на заданный угол → меньше угол = меньше картинка
+      mediaLayer.transform = layerTransform(-zoomOffset(z));
+      mediaLayer.centralHorizontalAngle = (state.projection === '360' ? 2 * Math.PI : Math.PI) * a;
+      mediaLayer.upperVerticalAngle = (Math.PI / 2) * a;
+      mediaLayer.lowerVerticalAngle = (-Math.PI / 2) * a;
+    }
+  } catch (e) { console.warn('layer props', e); }
+}
+
+function updateMediaLayer() {
+  if (!renderer?.xr?.isPresenting) return;
+  const session = renderer.xr.getSession();
+  const base = renderer.xr.getBaseLayer();
+  const want = layerWanted();
+  const key = want ? [state.projection, state.stereo, video.currentSrc, flatEye.w.toFixed(3), flatEye.h.toFixed(3)].join('|') : '';
+  if (want && key === mediaLayerKey && mediaLayer) { applyLayerProps(); return; }
+  if (mediaLayer) { try { mediaLayer.destroy(); } catch { /* ignore */ } mediaLayer = null; }
+  mediaLayerKey = '';
+  if (want) {
+    try {
+      mediaBinding = mediaBinding || new XRMediaBinding(session);
+      const layout = state.stereo === 'sbs' ? 'stereo-left-right' : state.stereo === 'tb' ? 'stereo-top-bottom' : 'mono';
+      const space = renderer.xr.getReferenceSpace();
+      mediaLayer = state.projection === 'flat'
+        ? mediaBinding.createQuadLayer(video, { space, layout, width: flatEye.w, height: flatEye.h })
+        : mediaBinding.createEquirectLayer(video, { space, layout, radius: R });
+      mediaLayerKey = key;
+      applyLayerProps();
+      session.updateRenderState({ layers: [mediaLayer, base] });
+      setSceneForLayer(true);
+      return;
+    } catch (e) {
+      console.warn('XR media layer:', e);
+      mediaLayer = null;
+      xrLayersOK = false;
+      ui?.toastMsg('XR-слой недоступен — включён совместимый режим', true);
+    }
+  }
+  if (base) { try { session.updateRenderState({ layers: [base] }); } catch { /* базовый XRWebGLLayer */ } }
+  setSceneForLayer(false);
+}
+
+// Сжимает сферу к направлению «вперёд»: угол от центра × a (видео становится меньше, как окно вдали)
+function applyAngular(a) {
+  if (!baseDirs || a === lastAngle) return;
+  lastAngle = a;
+  for (const m of mediaGroup.children) {
+    const pos = m.geometry.attributes.position;
+    const arr = pos.array;
+    for (let i = 0; i < arr.length; i += 3) {
+      const x = baseDirs[i] / R, y = baseDirs[i + 1] / R, zz = baseDirs[i + 2] / R;
+      const th = Math.acos(clamp(-zz, -1, 1));
+      if (th < 1e-6) { arr[i] = 0; arr[i + 1] = 0; arr[i + 2] = -R; continue; }
+      const az = Math.atan2(y, x), nt = th * a, sn = Math.sin(nt) * R;
+      arr[i] = sn * Math.cos(az); arr[i + 1] = sn * Math.sin(az); arr[i + 2] = -Math.cos(nt) * R;
+    }
+    pos.needsUpdate = true;
+    m.geometry.computeBoundingSphere();
+  }
+}
+
+function applyZoom() {
+  if (!mediaGroup) return;
+  const z = state.zoom;
+  if (state.projection === 'flat') mediaGroup.position.set(0, state.height, -flatDist(z));
+  else { mediaGroup.position.set(0, state.height, zoomOffset(z)); applyAngular(zoomAngle(z)); }
+  if (renderer?.xr?.isPresenting && layerWanted() !== !!mediaLayer) updateMediaLayer();
+  else applyLayerProps();
+}
+function setZoom(z) {
+  z = clamp(z, -1, 1);
+  if (Math.abs(z) < 0.02) z = 0; // «прилипание» к обычному размеру
+  state.zoom = z;
+  applyZoom();
+  syncZoomUI();
+}
+
+function setHeight(h) {
+  state.height = clamp(Math.round(h * 100) / 100, -1.5, 1.5);
+  applyZoom();
+}
+
+function applyWorldRotation() {
+  world.rotation.set(basePitch + tilt, baseYaw, 0, 'YXZ');
+  applyLayerProps();
+}
+
+function saveFormat() {
+  if (current && !String(current.id).startsWith('demo:')) {
+    LS.set('liquido.fmt.' + current.id, { projection: state.projection, stereo: state.stereo, swap: state.swap, zoom: state.zoom, height: state.height });
+  }
+}
+function setFormat(patch) {
+  Object.assign(state, patch);
+  saveFormat();
+  rebuildMedia();
+  syncControls();
+}
+
+function recenter() {
+  if (renderer?.xr?.isPresenting) {
+    const xrCam = renderer.xr.getCamera();
+    const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    xrCam.matrixWorld.decompose(pos, q, s);
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+    world.position.copy(pos);
+    baseYaw = Math.atan2(-fwd.x, -fwd.z);
+    basePitch = Math.asin(clamp(fwd.y, -1, 1)); // лёжа — видео встаёт перед глазами
+    tilt = 0;
+    applyWorldRotation();
+  } else {
+    yaw = 0; pitch = 0;
+  }
+}
+
+function seekBy(d) {
+  if (!isFinite(video.duration)) return;
+  video.currentTime = clamp(video.currentTime + d, 0, video.duration - 0.5);
+}
+function togglePlay() {
+  if (video.paused) video.play().catch((e) => stageMsg('Не удалось запустить: ' + e.message));
+  else video.pause();
+}
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+function setSpeed(v) {
+  prefs.speed = v; savePrefs();
+  video.defaultPlaybackRate = v;
+  video.playbackRate = v;
+}
+
+// ───────── плейлист: соседние видео текущей папки ─────────
+const isVideoFile = (f) => (f.mimeType || '').startsWith('video/');
+function playlist() { return nav.items.filter(isVideoFile); }
+function playSibling(dir) {
+  const list = playlist();
+  const i = list.findIndex((f) => f.id === current?.id);
+  const next = i >= 0 ? list[i + dir] : null;
+  if (!next) { ui?.toastMsg(dir > 0 ? 'Это последнее видео в папке' : 'Это первое видео в папке'); return; }
+  savePosition();
+  playFile(next).catch((e) => { banner(e.message); ui?.toastMsg(e.message, true); });
+}
+
+function setVolume(v) {
+  video.volume = clamp(v, 0, 1);
+  prefs.volume = video.volume;
+  savePrefs();
+  $('#cVol').value = Math.round(video.volume * 100);
+  paintRange($('#cVol'));
+}
+
+// ───────────────────────── VR-интерфейс (рисуется на canvas) ─────────────────────────
+const FONT = 'Manrope, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const C = {
+  bg: 'rgba(12,15,26,0.93)', card: 'rgba(255,255,255,0.07)', hover: 'rgba(255,255,255,0.16)',
+  text: '#eef2ff', muted: '#8e98b3', a1: '#35d0ff', a2: '#8b5cff', warn: '#ffd896',
+};
+const rr = (c, x, y, w, h, r) => { c.beginPath(); c.roundRect(x, y, w, h, r); };
+function grad(c, x, y, w) {
+  const g = c.createLinearGradient(x, y, x + w, y);
+  g.addColorStop(0, C.a1); g.addColorStop(1, C.a2);
+  return g;
+}
+function ellipsize(c, text, maxW) {
+  if (c.measureText(text).width <= maxW) return text;
+  let t = text;
+  while (t.length > 2 && c.measureText(t + '…').width > maxW) t = t.slice(0, -1);
+  return t + '…';
+}
+
+class CanvasPanel {
+  constructor(W, H, widthM) {
+    this.W = W; this.H = H;
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = W; this.canvas.height = H;
+    this.ctx = this.canvas.getContext('2d');
+    this.tex = new THREE.CanvasTexture(this.canvas);
+    this.tex.colorSpace = THREE.SRGBColorSpace;
+    this.tex.anisotropy = 8;
+    this.mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(widthM, widthM * H / W),
+      new THREE.MeshBasicMaterial({ map: this.tex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
+    );
+    this.mesh.renderOrder = 1000;
+    this.mesh.userData.panel = this;
+    this.regions = [];
+    this.hover = null;
+    this.lastDraw = 0;
+  }
+  begin() {
+    this.regions = [];
+    const c = this.ctx;
+    c.clearRect(0, 0, this.W, this.H);
+    rr(c, 4, 4, this.W - 8, this.H - 8, 52);
+    c.fillStyle = C.bg; c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.10)'; c.lineWidth = 3; c.stroke();
+    c.fillStyle = grad(c, 80, 0, this.W - 160);
+    rr(c, 80, 4, this.W - 160, 5, 3); c.fill();
+    c.textBaseline = 'middle';
+  }
+  end() { this.tex.needsUpdate = true; this.lastDraw = now(); }
+  region(id, x, y, w, h, onPress, drag = false) { this.regions.push({ id, x, y, w, h, onPress, drag }); }
+  hitAt(uv) {
+    const x = uv.x * this.W, y = (1 - uv.y) * this.H;
+    for (let i = this.regions.length - 1; i >= 0; i--) {
+      const r = this.regions[i];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return { panel: this, region: r, fx: clamp((x - r.x) / r.w, 0, 1) };
+    }
+    return { panel: this, region: null };
+  }
+  fxFor(region, uv) { return clamp((uv.x * this.W - region.x) / region.w, 0, 1); }
+}
+
+function drawIcon(c, name, cx, cy, s, color) {
+  c.save();
+  c.translate(cx, cy);
+  c.fillStyle = color; c.strokeStyle = color;
+  c.lineWidth = Math.max(3, s * 0.085); c.lineCap = 'round'; c.lineJoin = 'round';
+  const u = s / 2;
+  switch (name) {
+    case 'play':
+      c.beginPath(); c.moveTo(-u * 0.32, -u * 0.5); c.lineTo(u * 0.55, 0); c.lineTo(-u * 0.32, u * 0.5); c.closePath(); c.fill(); break;
+    case 'pause':
+      rr(c, -u * 0.42, -u * 0.48, u * 0.28, u * 0.96, u * 0.06); c.fill();
+      rr(c, u * 0.14, -u * 0.48, u * 0.28, u * 0.96, u * 0.06); c.fill(); break;
+    case 'back10': case 'fwd10': {
+      const r = u * 0.58;
+      c.save();
+      if (name === 'back10') c.scale(-1, 1);
+      const a0 = -Math.PI / 2 + 0.25, a1 = Math.PI * 1.5 - 0.55;
+      c.beginPath(); c.arc(0, 0, r, a0, a1); c.stroke();
+      const px = r * Math.cos(a1), py = r * Math.sin(a1);
+      const tx = -Math.sin(a1), ty = Math.cos(a1); // касательная по часовой
+      const nx = Math.cos(a1), ny = Math.sin(a1);
+      const h = u * 0.26;
+      c.beginPath();
+      c.moveTo(px + tx * h, py + ty * h);
+      c.lineTo(px + nx * h * 0.7, py + ny * h * 0.7);
+      c.lineTo(px - nx * h * 0.7, py - ny * h * 0.7);
+      c.closePath(); c.fill();
+      c.restore();
+      c.font = `800 ${Math.round(u * 0.5)}px ${FONT}`;
+      c.textAlign = 'center'; c.textBaseline = 'middle';
+      c.fillText('10', 0, u * 0.04);
+      break;
+    }
+    case 'gear': {
+      for (let i = 0; i < 8; i++) { c.save(); c.rotate(i * Math.PI / 4); rr(c, -u * 0.11, -u * 0.62, u * 0.22, u * 0.3, u * 0.05); c.fill(); c.restore(); }
+      c.lineWidth = u * 0.2;
+      c.beginPath(); c.arc(0, 0, u * 0.36, 0, Math.PI * 2); c.stroke();
+      break;
+    }
+    case 'center':
+      c.beginPath(); c.arc(0, 0, u * 0.42, 0, Math.PI * 2); c.stroke();
+      c.beginPath(); c.arc(0, 0, u * 0.12, 0, Math.PI * 2); c.fill();
+      for (const [dx, dy] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
+        c.beginPath(); c.moveTo(dx * u * 0.55, dy * u * 0.55); c.lineTo(dx * u * 0.72, dy * u * 0.72); c.stroke();
+      }
+      break;
+    case 'exit': case 'close':
+      c.beginPath(); c.moveTo(-u * 0.36, -u * 0.36); c.lineTo(u * 0.36, u * 0.36);
+      c.moveTo(u * 0.36, -u * 0.36); c.lineTo(-u * 0.36, u * 0.36); c.stroke(); break;
+    case 'grid':
+      for (const [dx, dy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) { rr(c, dx * u * 0.3 - u * 0.24, dy * u * 0.3 - u * 0.24, u * 0.48, u * 0.48, u * 0.1); c.fill(); }
+      break;
+    case 'prev': case 'next': {
+      c.save();
+      if (name === 'prev') c.scale(-1, 1);
+      c.beginPath(); c.moveTo(-u * 0.38, -u * 0.42); c.lineTo(u * 0.22, 0); c.lineTo(-u * 0.38, u * 0.42); c.closePath(); c.fill();
+      rr(c, u * 0.26, -u * 0.42, u * 0.14, u * 0.84, u * 0.04); c.fill();
+      c.restore();
+      break;
+    }
+    case 'back':
+      c.beginPath(); c.moveTo(u * 0.2, -u * 0.4); c.lineTo(-u * 0.2, 0); c.lineTo(u * 0.2, u * 0.4); c.stroke(); break;
+    case 'minus':
+      c.beginPath(); c.moveTo(-u * 0.38, 0); c.lineTo(u * 0.38, 0); c.stroke(); break;
+    case 'plus':
+      c.beginPath(); c.moveTo(-u * 0.38, 0); c.lineTo(u * 0.38, 0); c.moveTo(0, -u * 0.38); c.lineTo(0, u * 0.38); c.stroke(); break;
+  }
+  c.restore();
+}
+
+function iconButton(p, id, cx, cy, r, icon, onPress, opts = {}) {
+  const c = p.ctx, hov = p.hover === id;
+  c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2);
+  if (opts.primary) {
+    c.fillStyle = grad(c, cx - r, cy, 2 * r); c.fill();
+    if (hov) { c.lineWidth = 6; c.strokeStyle = 'rgba(255,255,255,0.9)'; c.stroke(); }
+  } else {
+    c.fillStyle = opts.active ? 'rgba(53,208,255,0.25)' : hov ? C.hover : C.card; c.fill();
+  }
+  const k = opts.primary ? 0.95 : (icon === 'back10' || icon === 'fwd10') ? 1.35 : 0.9;
+  drawIcon(c, icon, cx, cy, r * k, '#fff');
+  if (opts.label) {
+    c.fillStyle = hov ? C.text : C.muted;
+    c.font = `600 26px ${FONT}`; c.textAlign = 'center';
+    c.fillText(opts.label, cx, cy + r + 30);
+  }
+  p.region(id, cx - r, cy - r, 2 * r, 2 * r, onPress);
+}
+
+function textButton(p, id, x, y, w, h, label, onPress, primary) {
+  const c = p.ctx, hov = p.hover === id;
+  rr(c, x, y, w, h, h / 2);
+  c.fillStyle = primary ? grad(c, x, y, w) : hov ? C.hover : C.card; c.fill();
+  if (primary && hov) { c.lineWidth = 5; c.strokeStyle = 'rgba(255,255,255,0.9)'; c.stroke(); }
+  c.fillStyle = '#fff'; c.font = `700 32px ${FONT}`; c.textAlign = 'center';
+  c.fillText(ellipsize(c, label, w - 40), x + w / 2, y + h / 2 + 1);
+  p.region(id, x, y, w, h, onPress);
+}
+
+function segmented(p, id, x, y, w, h, options, value, onSelect) {
+  const c = p.ctx;
+  rr(c, x, y, w, h, h / 2); c.fillStyle = 'rgba(255,255,255,0.05)'; c.fill();
+  const sw = w / options.length;
+  options.forEach(([k, label], i) => {
+    const sx = x + i * sw, rid = id + ':' + k, active = k === value, hov = p.hover === rid;
+    if (active || hov) {
+      rr(c, sx + 6, y + 6, sw - 12, h - 12, (h - 12) / 2);
+      c.fillStyle = active ? grad(c, sx, y, sw) : C.hover; c.fill();
+    }
+    c.fillStyle = active ? '#fff' : C.text;
+    c.font = `${active ? 800 : 600} 32px ${FONT}`; c.textAlign = 'center';
+    c.fillText(ellipsize(c, label, sw - 24), sx + sw / 2, y + h / 2 + 1);
+    p.region(rid, sx, y, sw, h, () => onSelect(k));
+  });
+}
+
+function slider(p, id, x, y, w, h, v, onChange) {
+  const c = p.ctx, hov = p.hover === id, ty = y + h / 2;
+  rr(c, x, ty - 9, w, 18, 9); c.fillStyle = 'rgba(255,255,255,0.12)'; c.fill();
+  rr(c, x, ty - 9, Math.max(18, w * v), 18, 9); c.fillStyle = grad(c, x, ty, w); c.fill();
+  c.beginPath(); c.arc(x + w * v, ty, hov ? 26 : 20, 0, Math.PI * 2);
+  c.fillStyle = '#fff'; c.fill();
+  p.region(id, x, y, w, h, onChange, true);
+}
+
+function drawMain(p) {
+  const c = p.ctx, W = p.W;
+  p.begin();
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `700 40px ${FONT}`;
+  c.fillText(ellipsize(c, current?.name || 'LiquidoVR', W - 600), 60, 66);
+  c.textAlign = 'right'; c.fillStyle = C.muted; c.font = `600 34px ${FONT}`;
+  c.fillText(fmtTime(video.currentTime) + '  /  ' + fmtTime(video.duration), W - 60, 66);
+
+  // прогресс
+  const bx = 60, by = 128, bw = W - 120, dur = video.duration || 0;
+  const frac = dur ? video.currentTime / dur : 0, hov = p.hover === 'seek';
+  rr(c, bx, by - 8, bw, 16, 8); c.fillStyle = 'rgba(255,255,255,0.12)'; c.fill();
+  if (dur) {
+    c.fillStyle = 'rgba(255,255,255,0.16)';
+    for (let i = 0; i < video.buffered.length; i++) {
+      const s0 = video.buffered.start(i) / dur, e = video.buffered.end(i) / dur;
+      rr(c, bx + s0 * bw, by - 8, Math.max(0, (e - s0) * bw), 16, 8); c.fill();
+    }
+  }
+  rr(c, bx, by - 8, Math.max(16, bw * frac), 16, 8); c.fillStyle = grad(c, bx, by, bw); c.fill();
+  c.beginPath(); c.arc(bx + bw * frac, by, hov ? 22 : 15, 0, Math.PI * 2); c.fillStyle = '#fff'; c.fill();
+  p.region('seek', bx, by - 42, bw, 84, (fx) => { if (dur) video.currentTime = fx * dur; }, true);
+
+  // центр: предыдущее, −10, пауза, +10, следующее
+  const cy = 268, cx = W / 2;
+  iconButton(p, 'prev', cx - 340, cy, 48, 'prev', () => playSibling(-1));
+  iconButton(p, 'back', cx - 190, cy, 64, 'back10', () => seekBy(-10));
+  iconButton(p, 'play', cx, cy, 86, video.paused ? 'play' : 'pause', togglePlay, { primary: true });
+  iconButton(p, 'fwd', cx + 190, cy, 64, 'fwd10', () => seekBy(10));
+  iconButton(p, 'next', cx + 340, cy, 48, 'next', () => playSibling(1));
+
+  // слева: текущий формат (открывает настройки)
+  const chip = `${PROJ_NAME[state.projection]} · ${STEREO_NAME[state.stereo]} · ${mediaLayer ? 'XR' : QUALITY[prefs.quality].name}`;
+  textButton(p, 'fmt', 60, cy - 46, 410, 92, chip, () => ui.openSettings(true));
+  c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `600 24px ${FONT}`;
+  const res = video.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : '—';
+  const sp = (prefs.speed || 1) !== 1 ? `  ·  ${prefs.speed}×` : '';
+  c.fillText(`${res}  ·  Зум ${fmtZoom(state.zoom)}${sp}`, 72, cy + 80);
+
+  // справа: библиотека, настройки, центр, выход
+  iconButton(p, 'library', W - 460, cy, 54, 'grid', () => ui.openLibrary(), { active: ui.sheet === 'library' });
+  iconButton(p, 'settings', W - 340, cy, 54, 'gear', () => ui.openSettings(), { active: ui.sheet === 'settings' });
+  iconButton(p, 'center', W - 220, cy, 54, 'center', recenter);
+  iconButton(p, 'exit', W - 100, cy, 54, 'exit', () => renderer.xr.getSession()?.end());
+  p.end();
+}
+
+function sheetHeader(p, title, extra) {
+  const c = p.ctx, W = p.W;
+  c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 50px ${FONT}`;
+  c.fillText(title, 64, 84);
+  iconButton(p, 'close', W - 96, 84, 46, 'close', () => { ui.sheet = null; ui.setVisible(true); });
+  if (extra) extra();
+}
+
+function valueSlider(p, id, x, y, w, h, v01, text, onChange, step) {
+  const c = p.ctx;
+  iconButton(p, id + '-', x + 46, y + h / 2, 44, 'minus', () => onChange(clamp(v01 - step, 0, 1)));
+  slider(p, id, x + 120, y, w - 380, h, v01, onChange);
+  iconButton(p, id + '+', x + w - 214, y + h / 2, 44, 'plus', () => onChange(clamp(v01 + step, 0, 1)));
+  c.textAlign = 'right'; c.fillStyle = C.text; c.font = `800 34px ${FONT}`;
+  c.fillText(text, x + w, y + h / 2);
+}
+
+const TABS = [['video', 'Видео'], ['picture', 'Картинка'], ['play', 'Воспроизведение']];
+const signed = (v, digits = 0) => (v > 0.005 ? '+' : v < -0.005 ? '−' : '') + Math.abs(v).toFixed(digits);
+
+function drawSettings(p) {
+  const c = p.ctx, W = p.W;
+  p.begin();
+  sheetHeader(p, 'Настройки', () => {
+    segmented(p, 'tab', 410, 40, W - 410 - 170, 88, TABS, ui.tab, (k) => { ui.tab = k; ui.redraw(); });
+  });
+  const LX = 64, CX = 430, CW = W - CX - 64, RH = 92, STEP = 120;
+  let y = 170;
+  const label = (t) => { c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `700 32px ${FONT}`; c.fillText(t, LX, y + RH / 2); };
+  const note = (t) => { c.textAlign = 'left'; c.fillStyle = C.muted; c.font = `500 26px ${FONT}`; c.fillText(t, LX, y + 30); };
+
+  if (ui.tab === 'video') {
+    label('Проекция');
+    segmented(p, 'proj', CX, y, CW, RH, PROJ.map((k) => [k, PROJ_NAME[k]]), state.projection, (k) => setFormat({ projection: k }));
+    y += STEP;
+    label('3D-режим');
+    segmented(p, 'stereo', CX, y, CW, RH, STEREO.map((k) => [k, STEREO_LONG[k]]), state.stereo, (k) => setFormat({ stereo: k }));
+    y += STEP;
+    label('Глаза');
+    segmented(p, 'swap', CX, y, CW, RH, [['n', 'Левый | Правый'], ['s', 'Поменять местами']], state.swap ? 's' : 'n', (k) => setFormat({ swap: k === 's' }));
+    y += STEP;
+    label('Зум');
+    valueSlider(p, 'zoom', CX, y, CW, RH, (state.zoom + 1) / 2, fmtZoom(state.zoom), (v) => { setZoom(v * 2 - 1); saveFormat(); }, 0.05);
+    y += STEP;
+    label('Высота');
+    valueSlider(p, 'height', CX, y, CW, RH, (state.height + 1.5) / 3, signed(state.height * 100) + ' см',
+      (v) => { setHeight(v * 3 - 1.5); saveFormat(); }, 0.1 / 3);
+    y += STEP;
+    label('Угол fisheye');
+    segmented(p, 'fov', CX, y, CW, RH, [[180, '180°'], [190, '190°'], [200, '200°'], [220, '220°']], prefs.fisheyeFov || 180, (k) => {
+      prefs.fisheyeFov = k; savePrefs(); rebuildMedia();
+      if (state.projection !== 'fisheye') ui.toastMsg('Применяется к видео в проекции Fisheye');
+    });
+    y += STEP;
+    label('Вывод видео');
+    segmented(p, 'out', CX, y, CW, RH, [['layer', 'Чёткий (XR-слой)'], ['gl', 'Совместимый']], prefs.layers !== false ? 'layer' : 'gl', (k) => {
+      prefs.layers = k === 'layer'; savePrefs(); updateMediaLayer();
+      ui.toastMsg(prefs.layers ? (mediaLayer ? 'Чёткий режим включён' : 'XR-слой недоступен для этого формата/настроек') : 'Совместимый режим');
+    });
+    y += STEP + 10;
+    textButton(p, 'savedef', 64, y, 820, 92, 'Сделать форматом по умолчанию', () => {
+      Object.assign(prefs, { projection: state.projection, stereo: state.stereo, swap: state.swap, zoom: state.zoom });
+      savePrefs(); syncPrefsUI();
+      ui.toastMsg('Сохранено как формат по умолчанию');
+    }, true);
+    textButton(p, 'reset', 908, y, W - 908 - 64, 92, 'Сброс: 180° SBS', () => {
+      setFormat({ projection: '180', stereo: 'sbs', swap: false });
+      state.height = 0; setZoom(0); tilt = 0; if (renderer?.xr?.isPresenting) applyWorldRotation(); saveFormat();
+    });
+  } else if (ui.tab === 'picture') {
+    const pc = prefs.picture;
+    label('Яркость');
+    valueSlider(p, 'pb', CX, y, CW, RH, (pc.b + 1) / 2, signed(pc.b * 100), (v) => setPicture('b', v * 2 - 1), 0.05);
+    y += STEP;
+    label('Контраст');
+    valueSlider(p, 'pc', CX, y, CW, RH, (pc.c + 1) / 2, signed(pc.c * 100), (v) => setPicture('c', v * 2 - 1), 0.05);
+    y += STEP;
+    label('Насыщенность');
+    valueSlider(p, 'ps', CX, y, CW, RH, (pc.s + 1) / 2, signed(pc.s * 100), (v) => setPicture('s', v * 2 - 1), 0.05);
+    y += STEP + 10;
+    textButton(p, 'picreset', 64, y, 600, 92, 'Сбросить картинку', () => {
+      ['b', 'c', 's'].forEach((k) => setPicture(k, 0));
+    }, true);
+    y += STEP + 20;
+    note('Регулировки картинки работают в совместимом режиме вывода:');
+    y += 44;
+    note('пока они не равны нулю, чёткий XR-слой выключается автоматически.');
+  } else {
+    label('Скорость');
+    segmented(p, 'speed', CX, y, CW, RH, SPEEDS.map((v) => [v, v + '×']), prefs.speed || 1, (k) => { setSpeed(k); ui.toastMsg('Скорость ' + k + '×'); });
+    y += STEP;
+    label('Громкость');
+    valueSlider(p, 'vol', CX, y, CW, RH, video.volume, Math.round(video.volume * 100) + '%', (v) => setVolume(v), 0.1);
+    y += STEP;
+    label('Качество');
+    segmented(p, 'q', CX, y, CW, RH, QUALITY_KEYS.map((k) => [k, QUALITY[k].name]), prefs.quality, (k) => {
+      prefs.quality = k; savePrefs(); rebuildMedia(); syncPrefsUI();
+      ui.toastMsg('Чёткость рендера изменится при следующем входе в VR');
+    });
+    y += STEP;
+    label('Следующее видео');
+    segmented(p, 'autonext', CX, y, CW, RH, [['on', 'Включать автоматически'], ['off', 'Не включать']], prefs.autoNext ? 'on' : 'off', (k) => {
+      prefs.autoNext = k === 'on'; savePrefs();
+    });
+    y += STEP + 20;
+    note('Наклон видео — правый стик вверх/вниз, сброс — нажать правый стик.');
+  }
+  p.end();
+}
+
+function drawFolderIcon(c, cx, cy, s) {
+  c.fillStyle = 'rgba(155,231,255,0.85)';
+  rr(c, cx - s, cy - s * 0.55, s * 0.9, s * 0.3, s * 0.08); c.fill();
+  rr(c, cx - s, cy - s * 0.4, s * 2, s * 1.2, s * 0.12); c.fill();
+}
+
+function drawLibrary(p) {
+  const c = p.ctx, W = p.W;
+  p.begin();
+  const folder = nav.stack.length ? nav.stack[nav.stack.length - 1].name
+    : ({ shared: 'Доступные мне', recent: 'Недавние видео', search: 'Поиск: ' + nav.query }[nav.source] || 'Библиотека');
+  sheetHeader(p, '', () => {
+    let x = 64;
+    if (nav.stack.length > 1) {
+      iconButton(p, 'up', 110, 84, 46, 'back', () => {
+        nav.stack = nav.stack.slice(0, -1); ui.libPage = 0; loadList(true);
+      });
+      x = 180;
+    }
+    c.textAlign = 'left'; c.fillStyle = C.text; c.font = `800 46px ${FONT}`;
+    c.fillText(ellipsize(c, folder, W - x - 200), x, 84);
+  });
+
+  const items = nav.items.filter((f) => f.mimeType === FOLDER || isVideoFile(f));
+  const COLS = 4, ROWS = 3, PER = COLS * ROWS, GAP = 24;
+  const pages = Math.max(1, Math.ceil(items.length / PER));
+  ui.libPage = clamp(ui.libPage, 0, pages - 1);
+  const tw = (W - 128 - GAP * (COLS - 1)) / COLS, th = tw * 9 / 16, tileH = th + 78;
+  const pageItems = items.slice(ui.libPage * PER, ui.libPage * PER + PER);
+  if (!items.length) {
+    c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `600 34px ${FONT}`;
+    c.fillText(nav.loading ? 'Загрузка…' : 'Здесь нет видео', W / 2, 500);
+  }
+  pageItems.forEach((f, i) => {
+    const x = 64 + (i % COLS) * (tw + GAP), y = 160 + Math.floor(i / COLS) * (tileH + GAP);
+    const id = 'lib:' + f.id, hov = p.hover === id, isCur = f.id === current?.id;
+    rr(c, x, y, tw, tileH, 22);
+    c.fillStyle = hov ? C.hover : C.card; c.fill();
+    if (isCur) { c.lineWidth = 5; c.strokeStyle = C.a1; c.stroke(); }
+    c.save();
+    rr(c, x, y, tw, th, 22); c.clip();
+    c.fillStyle = '#0b0f1d'; c.fillRect(x, y, tw, th);
+    if (f.mimeType === FOLDER) drawFolderIcon(c, x + tw / 2, y + th / 2, 46);
+    else {
+      const img = vrThumb(f);
+      if (img && img.ok) {
+        const k = Math.max(tw / img.naturalWidth, th / img.naturalHeight);
+        const iw = img.naturalWidth * k, ih = img.naturalHeight * k;
+        c.drawImage(img, x + (tw - iw) / 2, y + (th - ih) / 2, iw, ih);
+      } else drawIcon(c, 'play', x + tw / 2, y + th / 2, 60, 'rgba(255,255,255,0.3)');
+      const d = f.videoMediaMetadata?.durationMillis;
+      if (d) {
+        const t = fmtTime(d / 1000);
+        c.font = `700 24px ${FONT}`;
+        const w2 = c.measureText(t).width + 24;
+        rr(c, x + tw - w2 - 10, y + th - 44, w2, 34, 17); c.fillStyle = 'rgba(0,0,0,0.7)'; c.fill();
+        c.fillStyle = '#fff'; c.textAlign = 'center'; c.fillText(t, x + tw - w2 / 2 - 10, y + th - 27);
+      }
+    }
+    c.restore();
+    c.textAlign = 'left'; c.fillStyle = isCur ? C.a1 : C.text; c.font = `700 26px ${FONT}`;
+    c.fillText(ellipsize(c, f.name, tw - 28), x + 16, y + th + 40);
+    p.region(id, x, y, tw, tileH, () => {
+      if (f.mimeType === FOLDER) { nav.stack.push({ id: f.id, name: f.name }); ui.libPage = 0; loadList(true); ui.redraw(); }
+      else { ui.sheet = null; ui.setVisible(true); openItem(f); }
+    });
+  });
+
+  // страницы
+  const py = p.H - 100;
+  if (ui.libPage > 0) iconButton(p, 'pgprev', W / 2 - 200, py + 40, 40, 'back', () => { ui.libPage--; ui.redraw(); });
+  c.textAlign = 'center'; c.fillStyle = C.muted; c.font = `700 30px ${FONT}`;
+  c.fillText(`${ui.libPage + 1} / ${pages}`, W / 2, py + 40);
+  if (ui.libPage < pages - 1) iconButton(p, 'pgnext', W / 2 + 200, py + 40, 40, 'next', () => { ui.libPage++; ui.redraw(); });
+  else if (nav.pageToken) textButton(p, 'more', W / 2 + 150, py + 4, 300, 72, 'Загрузить ещё', () => loadList(false));
+  p.end();
+}
+
+// превью для VR-библиотеки: только свои (same-origin), иначе canvas станет «грязным» для WebGL
+const vrThumbs = new Map();
+function vrThumb(f) {
+  if (vrThumbs.has(f.id)) return vrThumbs.get(f.id);
+  const img = new Image();
+  img.crossOrigin = 'anonymous'; // превью с ПК рисуется в VR-панель — нужен CORS, иначе WebGL откажется
+  img.ok = false;
+  img.onload = () => { img.ok = true; ui?.redraw(); };
+  img.src = ownThumbUrl(f);
+  vrThumbs.set(f.id, img);
+  return img;
+}
+
+function drawToast(p, text, warn) {
+  const c = p.ctx;
+  c.clearRect(0, 0, p.W, p.H);
+  rr(c, 4, 4, p.W - 8, p.H - 8, (p.H - 8) / 2);
+  c.fillStyle = 'rgba(12,15,26,0.92)'; c.fill();
+  c.strokeStyle = warn ? 'rgba(255,216,150,0.5)' : 'rgba(53,208,255,0.45)'; c.lineWidth = 3; c.stroke();
+  c.fillStyle = warn ? C.warn : C.text; c.font = `700 40px ${FONT}`;
+  c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillText(ellipsize(c, text, p.W - 80), p.W / 2, p.H / 2 + 1);
+  p.end();
+}
+
+class VRUI {
+  constructor(parent) {
+    this.main = new CanvasPanel(1800, 400, 1.35);
+    this.main.draw = () => drawMain(this.main);
+    this.main.mesh.position.set(0, -0.5, -1.15);
+    this.main.mesh.rotation.x = -0.42;
+    this.settings = new CanvasPanel(1600, 1180, 1.2);
+    this.settings.draw = () => drawSettings(this.settings);
+    this.library = new CanvasPanel(1600, 1180, 1.2);
+    this.library.draw = () => drawLibrary(this.library);
+    for (const s of [this.settings, this.library]) {
+      s.mesh.position.set(0, 0.16, -1.4);
+      s.mesh.rotation.x = -0.1;
+    }
+    this.toast = new CanvasPanel(1100, 130, 0.62);
+    this.toast.mesh.position.set(0, -0.2, -1.2);
+    this.toast.mesh.renderOrder = 1002;
+    parent.add(this.main.mesh, this.settings.mesh, this.library.mesh, this.toast.mesh);
+    this.visible = false;
+    this.sheet = null; // 'settings' | 'library' | null
+    this.tab = 'video';
+    this.libPage = 0;
+    this.toastUntil = 0;
+    this.lastActivity = now();
+    this.setVisible(false);
+    this.toast.mesh.visible = false;
+  }
+  get settingsOpen() { return this.sheet === 'settings'; }
+  setVisible(v) {
+    this.visible = v;
+    this.main.mesh.visible = v;
+    this.settings.mesh.visible = v && this.sheet === 'settings';
+    this.library.mesh.visible = v && this.sheet === 'library';
+    if (v) { this.lastActivity = now(); this.redraw(); }
+  }
+  toggle() { this.setVisible(!this.visible); }
+  openSheet(name, open) {
+    const want = open ?? this.sheet !== name;
+    if (want) this.sheet = name;
+    else if (this.sheet === name) this.sheet = null;
+    this.setVisible(this.visible || !!this.sheet);
+  }
+  openSettings(open) { this.openSheet('settings', open); }
+  openLibrary(open) {
+    if ((open ?? this.sheet !== 'library') && current) {
+      const list = nav.items.filter((f) => f.mimeType === FOLDER || isVideoFile(f));
+      const i = list.findIndex((f) => f.id === current.id);
+      if (i >= 0) this.libPage = Math.floor(i / 12);
+    }
+    this.openSheet('library', open);
+  }
+  interactive() { return [this.main, this.settings, this.library]; }
+  panels() { return this.interactive().filter((p) => p.mesh.visible); }
+  redraw() { for (const p of this.panels()) p.draw(); }
+  toastMsg(text, warn = false, ms) {
+    if (!renderer?.xr?.isPresenting) return;
+    drawToast(this.toast, text, warn);
+    this.toast.mesh.visible = true;
+    this.toastUntil = now() + (ms || (warn ? 5000 : 1300));
+  }
+  tick(t, hovering) {
+    if (this.toast.mesh.visible && t > this.toastUntil) this.toast.mesh.visible = false;
+    if (hovering) this.lastActivity = t;
+    if (this.visible && !video.paused && !this.sheet && t - this.lastActivity > 6000) {
+      this.setVisible(false); // автоскрытие во время просмотра
+    } else if (this.visible && t - this.main.lastDraw > 250) {
+      this.main.draw();
+      if (this.settings.mesh.visible) this.settings.draw();
+    }
+  }
+}
+
+// ───────────────────────── ввод: лучи, курок, стики ─────────────────────────
+const raycaster = new THREE.Raycaster();
+const tmpM = new THREE.Matrix4();
+
+function pulse(c, intensity = 0.25, ms = 18) {
+  try { c.userData.source?.gamepad?.hapticActuators?.[0]?.pulse(intensity, ms); } catch { /* ignore */ }
+}
+
+function onSelectStart(c) {
+  const h = c.userData.hit;
+  ui.lastActivity = now();
+  if (ui.visible && h) {
+    if (h.region) {
+      h.region.onPress(h.fx);
+      if (h.region.drag) c.userData.drag = { panel: h.panel, region: h.region };
+      pulse(c, 0.5, 30);
+      ui.redraw();
+    }
+  } else {
+    ui.toggle();
+  }
+}
+
+function updatePointers() {
+  let hovering = false;
+  const hovers = new Map();
+  for (const c of controllers) {
+    const ud = c.userData;
+    ud.hit = null;
+    let len = 4;
+    if (c.visible && ui.visible) {
+      tmpM.identity().extractRotation(c.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpM);
+      const hit = raycaster.intersectObjects(ui.panels().map((p) => p.mesh), false)[0];
+      if (hit) {
+        len = hit.distance;
+        const p = hit.object.userData.panel;
+        ud.hit = p.hitAt(hit.uv);
+        ud.uv = hit.uv;
+        hovering = true;
+        if (ud.hit.region) hovers.set(p, ud.hit.region.id);
+        ud.dot.visible = true;
+        ud.dot.position.copy(hit.point);
+        ud.dot.quaternion.copy(hit.object.getWorldQuaternion(new THREE.Quaternion()));
+        if (ud.drag && ud.drag.panel === p) ud.drag.region.onPress(p.fxFor(ud.drag.region, hit.uv));
+      } else ud.dot.visible = false;
+    } else ud.dot.visible = false;
+    const hid = ud.hit?.region?.id || null;
+    if (hid && hid !== ud.hoverId) pulse(c, 0.15, 12);
+    ud.hoverId = hid;
+    ud.ray.scale.z = len;
+  }
+  for (const p of ui.interactive()) {
+    const hv = hovers.get(p) || null;
+    if (hv !== p.hover) { p.hover = hv; if (p.mesh.visible) p.draw(); }
+  }
+  return hovering;
+}
+
+const prevButtons = {};
+let seekHold = 0;
+function handleGamepads(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const hand = src.handedness;
+    const prev = prevButtons[hand] || [];
+    const pressed = (i) => gp.buttons[i]?.pressed && !prev[i];
+    const ax = gp.axes[2] ?? 0, ay = gp.axes[3] ?? 0;
+    if (hand === 'right') {
+      // правый стик влево/вправо — зум
+      if (Math.abs(ax) > 0.15 && Math.abs(ax) >= Math.abs(ay)) {
+        setZoom(state.zoom + ax * dt * 0.8);      // вправо — приблизить, влево — отдалить
+        ui.toastMsg('Зум ' + fmtZoom(state.zoom));
+      } else if (Math.abs(ay) > 0.2) {
+        tilt = clamp(tilt + ay * dt * 0.9, -1.3, 1.3); // вверх/вниз — наклон камеры
+        applyWorldRotation();
+        ui.toastMsg('Наклон ' + Math.round(-tilt * 180 / Math.PI) + '°');
+      }
+      if (pressed(4)) togglePlay();                       // A
+      if (pressed(5)) ui.toggle();                        // B
+      if (pressed(3)) { setZoom(prefs.zoom); tilt = 0; applyWorldRotation(); ui.toastMsg('Зум и наклон сброшены'); } // нажатие правого стика
+      if (prev[0] === undefined) { /* first frame */ }
+    } else if (hand === 'left') {
+      // левый стик: ↔ перемотка, ↕ громкость
+      if (Math.abs(ax) > 0.7 && Math.abs(ax) > Math.abs(ay)) {
+        seekHold -= dt;
+        if (seekHold <= 0) {
+          seekBy(ax > 0 ? 10 : -10);
+          ui.toastMsg((ax > 0 ? '+10 с  →  ' : '−10 с  →  ') + fmtTime(video.currentTime));
+          seekHold = 0.35;
+        }
+      } else seekHold = 0;
+      if (Math.abs(ay) > 0.3 && Math.abs(ay) > Math.abs(ax)) {
+        setVolume(video.volume - ay * dt * 0.6);
+        ui.toastMsg('Громкость ' + Math.round(video.volume * 100) + '%');
+      }
+      if (pressed(4)) ui.openSettings();                  // X — настройки
+      if (pressed(5)) togglePlay();                       // Y
+      if (pressed(3)) { recenter(); ui.toastMsg('Центрировано'); } // нажатие левого стика
+    }
+    if (gp.buttons.some((b, i) => b.pressed && !prev[i])) ui.lastActivity = now();
+    prevButtons[hand] = gp.buttons.map((b) => b.pressed);
+  }
+}
+
+const clock = new THREE.Clock();
+function renderFrame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (renderer.xr.isPresenting) {
+    if (recenterFrames > 0 && --recenterFrames === 0) recenter();
+    handleGamepads(dt);
+    const hovering = updatePointers();
+    ui.tick(now(), hovering);
+  } else {
+    camera.rotation.set(pitch, yaw, 0, 'YXZ');
+  }
+  renderer.render(scene, camera);
+}
+
+// ───────────────────────── воспроизведение ─────────────────────────
+async function playFile(f) {
+  await ensureSW();
+  await getToken();
+  await sendAuthToSW();
+  current = f;
+  const fmt = fileFormat(f);
+  if (!LS.get('liquido.fmt.' + f.id, null) && !fmt.marked) {
+    stageMsg('Определяю формат видео…');
+    ui?.toastMsg('Определяю формат видео…');
+    const meta = await probeFormat(f);
+    if (meta.projection) fmt.projection = meta.projection;
+    if (meta.stereo) fmt.stereo = meta.stereo;
+  }
+  Object.assign(state, { projection: fmt.projection, stereo: fmt.stereo, swap: fmt.swap, zoom: fmt.zoom ?? prefs.zoom, height: fmt.height || 0 });
+  showPlayer();
+  $('#nowTitle').textContent = f.name;
+  currentSrc = 'stream/' + encodeURIComponent(f.id) + '?size=' + (f.size || 0) + '&mime=' + encodeURIComponent(guessMime(f));
+  startVideo(currentSrc, LS.get('liquido.pos.' + f.id, 0));
+}
+
+function startVideo(src, resumeAt) {
+  initScene();
+  stageMsg('Загрузка потока…');
+  video.volume = prefs.volume;
+  video.src = src;
+  video.defaultPlaybackRate = prefs.speed || 1;
+  video.playbackRate = prefs.speed || 1;
+  video.load();
+  video.dataset.resume = resumeAt || 0;
+  rebuildMedia();
+  syncControls();
+  renderer.setAnimationLoop(renderFrame);
+  video.play().catch(() => stageMsg('Нажмите ▶ для запуска'));
+}
+
+function savePosition() {
+  if (!current || !isFinite(video.duration) || String(current.id).startsWith('demo:')) return;
+  const t = video.currentTime;
+  if (t > 10 && t < video.duration - 15) LS.set('liquido.pos.' + current.id, t);
+  else LS.del('liquido.pos.' + current.id);
+  saveFormat();
+}
+
+video.addEventListener('loadedmetadata', () => {
+  if (videoTex) videoTex.dispose();
+  videoTex = new THREE.VideoTexture(video);
+  videoTex.colorSpace = THREE.SRGBColorSpace;
+  videoTex.minFilter = THREE.LinearFilter;
+  videoTex.magFilter = THREE.LinearFilter;
+  videoTex.generateMipmaps = false;
+  rebuildMedia();
+  const r = Number(video.dataset.resume) || 0;
+  if (r > 0 && r < video.duration - 5) {
+    video.currentTime = r;
+    stageMsg('Продолжаем с ' + fmtTime(r));
+    ui?.toastMsg('Продолжаем с ' + fmtTime(r), false, 2500);
+  } else stageMsg('');
+  video.dataset.resume = 0;
+  setTimeout(() => { if (!video.paused) stageMsg(''); }, 2500);
+});
+video.addEventListener('waiting', () => stageMsg('Буферизация…'));
+video.addEventListener('playing', () => stageMsg(''));
+video.addEventListener('play', syncControls);
+video.addEventListener('pause', () => { syncControls(); savePosition(); });
+video.addEventListener('timeupdate', () => {
+  syncTime();
+  if (now() - lastPosSave > 5000) { lastPosSave = now(); savePosition(); }
+});
+video.addEventListener('ended', () => {
+  if (current) LS.del('liquido.pos.' + current.id);
+  const list = playlist();
+  const i = list.findIndex((f) => f.id === current?.id);
+  if (prefs.autoNext && i >= 0 && list[i + 1]) { ui?.toastMsg('Следующее: ' + list[i + 1].name, false, 2500); playSibling(1); }
+  else ui?.setVisible(true);
+});
+video.addEventListener('error', () => {
+  if (!video.getAttribute('src')) return;
+  const code = video.error?.code;
+  const text = code === 4
+    ? 'Браузер не смог открыть видео: неподдерживаемый формат/кодек или нет доступа к файлу.\nQuest Browser обычно играет MP4/MKV/WebM с H.264, H.265 (HEVC), VP9, AV1.'
+    : code === 2 ? 'Сетевая ошибка при загрузке потока.' : 'Ошибка воспроизведения (код ' + code + ').';
+  stageMsg(text);
+  ui?.toastMsg(text.split('\n')[0], true);
+});
+
+// ───────────────────────── 2D-интерфейс ─────────────────────────
+function showPlayer() {
+  $('#viewBrowser').hidden = true;
+  $('#viewPlayer').hidden = false;
+  window.scrollTo(0, 0);
+}
+function showBrowser() {
+  if (renderer?.xr?.isPresenting) renderer.xr.getSession().end();
+  savePosition();
+  video.pause();
+  if (video.getAttribute('src')) { video.removeAttribute('src'); video.load(); }
+  renderer?.setAnimationLoop(null);
+  current = null;
+  $('#viewPlayer').hidden = true;
+  $('#viewBrowser').hidden = false;
+  stageMsg('');
+}
+
+function paintRange(el) {
+  const min = Number(el.min) || 0, max = Number(el.max) || 100;
+  el.style.setProperty('--fill', ((el.value - min) / (max - min)) * 100 + '%');
+}
+
+function buildSegmented(el, options, onPick) {
+  el.replaceChildren();
+  for (const [k, label] of options) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.k = k;
+    b.textContent = label;
+    b.onclick = () => onPick(k);
+    el.append(b);
+  }
+}
+function setSegmented(el, value) { el.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.k === value)); }
+
+let seeking = false;
+function syncTime() {
+  $('#cTimeCur').textContent = fmtTime(video.currentTime);
+  $('#cTime').textContent = fmtTime(video.duration);
+  if (!seeking && isFinite(video.duration) && video.duration > 0) {
+    $('#cSeek').value = Math.round((video.currentTime / video.duration) * 1000);
+    paintRange($('#cSeek'));
+  }
+}
+function syncZoomUI() {
+  $('#cZoom').value = Math.round(state.zoom * 100);
+  $('#cZoomVal').textContent = fmtZoom(state.zoom);
+  paintRange($('#cZoom'));
+}
+function syncControls() {
+  $('#cPlay').innerHTML = video.paused ? ICONS.play : ICONS.pause;
+  setSegmented($('#segProj'), state.projection);
+  setSegmented($('#segStereo'), state.stereo);
+  $('#cSwap').checked = state.swap;
+  $('#cVol').value = Math.round(video.volume * 100);
+  paintRange($('#cVol'));
+  syncZoomUI();
+  syncTime();
+  ui?.redraw();
+}
+
+function syncPrefsUI() {
+  setSegmented($('#prefProj'), prefs.projection);
+  setSegmented($('#prefStereo'), prefs.stereo);
+  setSegmented($('#prefQuality'), prefs.quality);
+  $('#prefZoom').value = Math.round(prefs.zoom * 100);
+  $('#prefZoomVal').textContent = fmtZoom(prefs.zoom);
+  paintRange($('#prefZoom'));
+  $('#prefSwap').checked = prefs.swap;
+  $('#prefAutoVR').checked = prefs.autoVR;
+}
+
+function enterVR() {
+  if (!xrSupported) {
+    banner('VR доступен в браузере Meta Quest (адрес http://localhost:8080).');
+    return Promise.resolve(false);
+  }
+  initScene();
+  if (renderer.xr.isPresenting) return Promise.resolve(true);
+  renderer.xr.setFramebufferScaleFactor(QUALITY[prefs.quality].scale);
+  // requestSession вызывается синхронно внутри жеста пользователя
+  return navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'layers'] })
+    .then(async (session) => {
+      await renderer.xr.setSession(session);
+      renderer.setAnimationLoop(renderFrame);
+      return true;
+    })
+    .catch((e) => { banner('Не удалось войти в VR: ' + e.message); return false; });
+}
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  $('#btnInstall').hidden = false;
+});
+window.addEventListener('appinstalled', () => { $('#btnInstall').hidden = true; });
+
+function bindUI() {
+  $('#btnLogin').onclick = async () => { if (await checkAccount()) openSource('root'); };
+  $('#btnInstall').onclick = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => {});
+    installPrompt = null;
+    $('#btnInstall').hidden = true;
+  };
+  $$('.tabs button').forEach((b) => { b.onclick = () => openSource(b.dataset.src); });
+  $('#linkForm').onsubmit = (e) => { e.preventDefault(); openLink($('#linkInput').value); };
+  $('#searchForm').onsubmit = (e) => {
+    e.preventDefault();
+    const q = $('#searchInput').value.trim();
+    if (!q) return;
+    setActiveTab(null);
+    nav.source = 'search'; nav.query = q; nav.stack = [];
+    loadList(true);
+  };
+  $('#showAll').onchange = () => loadList(true);
+  $('#btnMore').onclick = () => loadList(false);
+  $('#btnBack').onclick = showBrowser;
+  $('#btnVR').onclick = () => { if (renderer?.xr?.isPresenting) renderer.xr.getSession().end(); else enterVR(); };
+  $('#cPlay').onclick = togglePlay;
+  $('#cBack').onclick = () => seekBy(-10);
+  $('#cFwd').onclick = () => seekBy(10);
+  $('#cCenter').onclick = recenter;
+  $('#cSeek').addEventListener('input', (e) => { seeking = true; paintRange(e.target); });
+  $('#cSeek').addEventListener('change', () => {
+    seeking = false;
+    if (isFinite(video.duration)) video.currentTime = ($('#cSeek').value / 1000) * video.duration;
+  });
+  buildSegmented($('#segProj'), PROJ.map((k) => [k, PROJ_NAME[k]]), (k) => setFormat({ projection: k }));
+  buildSegmented($('#segStereo'), STEREO.map((k) => [k, STEREO_NAME[k]]), (k) => setFormat({ stereo: k }));
+  $('#cSwap').onchange = (e) => setFormat({ swap: e.target.checked });
+  $('#cZoom').oninput = (e) => { setZoom(e.target.value / 100); saveFormat(); };
+  $('#cVol').oninput = (e) => setVolume(e.target.value / 100);
+
+  // диалог настроек
+  buildSegmented($('#prefProj'), PROJ.map((k) => [k, PROJ_NAME[k]]), (k) => { prefs.projection = k; savePrefs(); syncPrefsUI(); });
+  buildSegmented($('#prefStereo'), STEREO.map((k) => [k, STEREO_LONG[k]]), (k) => { prefs.stereo = k; savePrefs(); syncPrefsUI(); });
+  buildSegmented($('#prefQuality'), QUALITY_KEYS.map((k) => [k, QUALITY[k].name]), (k) => { prefs.quality = k; savePrefs(); syncPrefsUI(); rebuildMedia(); });
+  $('#prefZoom').oninput = (e) => { prefs.zoom = e.target.value / 100; savePrefs(); syncPrefsUI(); };
+  $('#prefSwap').onchange = (e) => { prefs.swap = e.target.checked; savePrefs(); };
+  $('#prefAutoVR').onchange = (e) => { prefs.autoVR = e.target.checked; savePrefs(); };
+  $('#btnPrefs').onclick = () => { syncPrefsUI(); $('#dlgPrefs').showModal(); };
+  $('#dlgPrefs').addEventListener('close', () => {
+    if ($('#dlgPrefs').returnValue === 'reset') { prefs = { ...DEFAULT_PREFS }; savePrefs(); syncPrefsUI(); }
+    if (!$('#viewBrowser').hidden && account) loadList(true); // обновить метки форматов
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if ($('#viewPlayer').hidden || /INPUT|SELECT|TEXTAREA/.test(document.activeElement?.tagName)) return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    if (e.code === 'ArrowLeft') seekBy(-10);
+    if (e.code === 'ArrowRight') seekBy(10);
+  });
+  window.addEventListener('beforeunload', savePosition);
+  $$('input[type=range]').forEach(paintRange);
+}
+
+async function init() {
+  bindUI();
+  updateAuthUI();
+  syncPrefsUI();
+  if (!window.isSecureContext) {
+    banner('Откройте плеер по адресу http://localhost:8080 или через приложение LiquidoVR. По IP-адресу VR и поток работать не будут.');
+  }
+  try {
+    xrSupported = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-vr');
+  } catch { xrSupported = false; }
+  // В приложении LiquidoVR (Quest) сразу входим в VR и открываем библиотеку:
+  // запуск по иконке считается действием пользователя для requestSession.
+  if (IS_APP && xrSupported && !new URLSearchParams(location.search).get('demo')) {
+    enterVR().then((ok) => { if (ok) ui.openLibrary(true); });
+  }
+  if (!xrSupported) $('#btnVR').title = 'VR доступен в браузере Meta Quest';
+
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    try { swReg = await navigator.serviceWorker.register('./sw.js'); } catch (e) { console.warn('SW:', e.message); }
+  }
+
+  // Отладка без Google: ?demo=<url видео> — проигрывает файл напрямую
+  const demo = new URLSearchParams(location.search).get('demo');
+  if (demo) {
+    current = { id: 'demo:' + demo, name: decodeURIComponent(demo.split('/').pop()) };
+    Object.assign(state, detectFormat(current.name), { zoom: prefs.zoom });
+    showPlayer();
+    $('#nowTitle').textContent = current.name + ' (демо)';
+    currentSrc = demo;
+    startVideo(demo, 0);
+    window.__liquido = { ui, state, setFormat, setZoom, setPitch: (v) => { pitch = v; } }; // отладка
+    return;
+  }
+
+  if (await checkAccount()) openSource('root');
+  else loadList(true);
+}
+
+init();
