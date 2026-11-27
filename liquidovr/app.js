@@ -994,7 +994,7 @@ function initScene() {
     updateNativeMode();
     ui.setVisible(true);
     $('#btnVR span').textContent = 'Выйти из VR';
-    video.play().catch(() => {});
+    if (!pbActive) video.play().catch(() => {});   // идёт предзагрузка — видео стартует само, когда наберётся запас
   });
   renderer.xr.addEventListener('sessionend', () => {
     camera.layers.enable(1);
@@ -1543,6 +1543,7 @@ function seekBy(d) {
   video.currentTime = clamp(video.currentTime + d, 0, video.duration - 0.5);
 }
 function togglePlay() {
+  pbToken++;                       // пользователь сам нажал — отменяем ожидание предзагрузки
   if (video.paused) video.play().catch((e) => stageMsg('Не удалось запустить: ' + e.message));
   else video.pause();
 }
@@ -2438,7 +2439,6 @@ function handleGamepads(dt) {
           zoomHold -= dt; z = 0;                  // держите стик дальше — зум продолжит меняться
         }
         if (z !== state.zoom) { setZoom(z, false); zoomMoved = true; }
-        ui.toastMsg('Зум ' + fmtZoom(state.zoom), false, 900);
       } else if (Math.abs(ay) > 0.2) {
         tilt = clamp(tilt + ay * dt * 0.9, -1.3, 1.3); // вверх/вниз — наклон камеры
         applyWorldRotation();
@@ -2523,7 +2523,7 @@ function startVideo(src, resumeAt) {
   rebuildMedia();
   syncControls();
   renderer.setAnimationLoop(renderFrame);
-  video.play().catch(() => stageMsg('Нажмите ▶ для запуска'));
+  // старт — после предзагрузки (см. loadedmetadata → prebufferThenPlay)
 }
 
 function savePosition() {
@@ -2554,6 +2554,7 @@ video.addEventListener('loadedmetadata', () => {
     ui?.toastMsg('Продолжаем с ' + fmtTime(r), false, 2500);
   } else stageMsg('');
   video.dataset.resume = 0;
+  prebufferThenPlay(8, 12000);         // накопить ~8 с видео перед стартом
   setTimeout(() => { if (!video.paused) stageMsg(''); }, 2500);
 });
 // «Загрузка…» в шлеме: без неё в VR видео просто замирает. Короткие паузы (<0,7 с) не показываем.
@@ -2564,7 +2565,7 @@ function bufferingOn() {
   bufTimer = setTimeout(() => {
     if (video.paused || video.readyState >= 3) return;
     bufShown = true;
-    ui?.toastMsg('Загрузка…', false, 600000);
+    // без надписи в шлеме (по просьбе) — только на странице ПК
   }, 700);
 }
 function bufferingOff() {
@@ -2574,7 +2575,38 @@ function bufferingOff() {
   bufShown = false;
 }
 video.addEventListener('waiting', bufferingOn);
-video.addEventListener('seeking', () => { if (!video.paused) bufferingOn(); });
+video.addEventListener('seeking', () => {
+  if (!video.paused || pbActive) { seekWasPlaying = true; if (!video.paused) bufferingOn(); }
+});
+video.addEventListener('seeked', () => {
+  if (seekWasPlaying) { seekWasPlaying = false; prebufferThenPlay(4, 8000); }   // после перемотки — ~4 с запаса
+});
+
+// ── Предзагрузка: перед стартом и после перемотки ждём, пока в буфере наберётся запас видео,
+// и только потом запускаем. Иначе на неровном интернете кадры не успевают приходить — рывки и мигание.
+let pbToken = 0, pbActive = false, seekWasPlaying = false;
+function bufferedAhead() {
+  const t = video.currentTime;
+  for (let i = 0; i < video.buffered.length; i++) {
+    if (video.buffered.start(i) <= t + 0.3 && video.buffered.end(i) > t) return video.buffered.end(i) - t;
+  }
+  return 0;
+}
+async function prebufferThenPlay(targetSec, maxWaitMs) {
+  const my = ++pbToken;
+  pbActive = true;
+  if (!video.paused) video.pause();
+  const t0 = now();
+  while (my === pbToken) {
+    const left = isFinite(video.duration) ? video.duration - video.currentTime - 0.5 : Infinity;
+    if (video.readyState >= 3 && bufferedAhead() >= Math.min(targetSec, left)) break;
+    if (now() - t0 > maxWaitMs) break;               // медленная сеть — не ждём бесконечно
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  if (my !== pbToken) return;                         // пользователь нажал паузу/пуск сам
+  pbActive = false;
+  video.play().catch(() => stageMsg('Нажмите ▶ для запуска'));
+}
 for (const ev of ['playing', 'canplay', 'pause', 'emptied', 'ended']) video.addEventListener(ev, bufferingOff);
 video.addEventListener('play', syncControls);
 video.addEventListener('pause', () => { syncControls(); savePosition(); });
